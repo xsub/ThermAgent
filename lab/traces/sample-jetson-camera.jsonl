@@ -1,0 +1,6 @@
+{"t_s":0,"temp_c":48.0,"fps":0.0,"active":false}
+{"t_s":5,"temp_c":52.0,"fps":8.7,"active":true}
+{"t_s":10,"temp_c":63.0,"fps":15.5,"active":true}
+{"t_s":20,"temp_c":72.5,"fps":15.1,"active":true}
+{"t_s":30,"temp_c":79.2,"fps":9.0,"active":true}
+{"t_s":40,"temp_c":67.0,"fps":0.0,"active":false,"stale":true}

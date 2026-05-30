@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""thermagentctl: optional Python helper for thermagentd PoC.
+
+No third-party dependencies are required. The parser intentionally mirrors the
+small Rust policy format: one `key: value` or `key = value` pair per line.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import sys
+import time
+from dataclasses import dataclass
+from typing import Any
+
+REQUIRED_KEYS = {
+    "name": str,
+    "sample_interval_ms": int,
+    "max_temp_c": float,
+    "critical_temp_c": float,
+    "min_fps": float,
+    "workload_stale_after_s": int,
+    "idle_nvpmodel_mode": int,
+    "active_nvpmodel_mode": int,
+    "hot_nvpmodel_mode": int,
+    "idle_cpu_governor": str,
+    "active_cpu_governor": str,
+    "hot_cpu_governor": str,
+    "nvpmodel_bin": str,
+    "workload_file": str,
+    "prometheus_listen": str,
+}
+
+DEFAULT_WORKLOAD_PATH = pathlib.Path("/run/thermagent/workload.metrics")
+
+
+@dataclass(frozen=True)
+class Decision:
+    reason: str
+    nvpmodel_mode: int
+    cpu_governor: str
+
+
+def strip_comment(line: str) -> str:
+    return line.split("#", 1)[0].strip()
+
+
+def unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
+
+
+def parse_policy(path: pathlib.Path) -> dict[str, Any]:
+    data: dict[str, str] = {}
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = strip_comment(raw)
+        if not line or line == "---":
+            continue
+        if ":" in line:
+            key, value = line.split(":", 1)
+        elif "=" in line:
+            key, value = line.split("=", 1)
+        else:
+            raise ValueError(f"{path}:{lineno}: expected 'key: value' or 'key = value'")
+        data[key.strip()] = unquote(value)
+
+    unknown = sorted(set(data) - set(REQUIRED_KEYS))
+    if unknown:
+        raise ValueError(f"unknown policy keys: {', '.join(unknown)}")
+
+    missing = sorted(set(REQUIRED_KEYS) - set(data))
+    if missing:
+        raise ValueError(f"missing policy keys: {', '.join(missing)}")
+
+    typed: dict[str, Any] = {}
+    for key, typ in REQUIRED_KEYS.items():
+        try:
+            typed[key] = typ(data[key])
+        except Exception as exc:  # noqa: BLE001 - human-facing validation tool
+            raise ValueError(f"{key}: cannot convert {data[key]!r} to {typ.__name__}") from exc
+
+    if typed["critical_temp_c"] <= typed["max_temp_c"]:
+        raise ValueError("critical_temp_c must be greater than max_temp_c")
+    if typed["sample_interval_ms"] < 100:
+        raise ValueError("sample_interval_ms should be >= 100 for this PoC")
+    return typed
+
+
+def decide(policy: dict[str, Any], temp_c: float | None, active: bool, fps: float | None, stale: bool = False) -> Decision:
+    max_temp = temp_c or 0.0
+    if max_temp >= policy["critical_temp_c"]:
+        return Decision("critical_cooldown", policy["hot_nvpmodel_mode"], policy["hot_cpu_governor"])
+    if max_temp >= policy["max_temp_c"]:
+        return Decision("thermal_guard", policy["hot_nvpmodel_mode"], policy["hot_cpu_governor"])
+    if active:
+        reason = "active_below_fps_target" if (fps is not None and fps < policy["min_fps"]) else "active"
+        return Decision(reason, policy["active_nvpmodel_mode"], policy["active_cpu_governor"])
+    return Decision("idle_or_no_workload_hint" if stale else "idle", policy["idle_nvpmodel_mode"], policy["idle_cpu_governor"])
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    policy = parse_policy(args.policy)
+    print(json.dumps(policy, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_simulate(args: argparse.Namespace) -> int:
+    policy = parse_policy(args.policy)
+    trace_path: pathlib.Path = args.trace
+    rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    print("t_s,temp_c,fps,active,reason,nvpmodel_mode,cpu_governor")
+    for row in rows:
+        decision = decide(
+            policy,
+            temp_c=_maybe_float(row.get("temp_c")),
+            active=bool(row.get("active", False)),
+            fps=_maybe_float(row.get("fps")),
+            stale=bool(row.get("stale", False)),
+        )
+        print(
+            f"{row.get('t_s', '')},{row.get('temp_c', '')},{row.get('fps', '')},{int(bool(row.get('active', False)))},"
+            f"{decision.reason},{decision.nvpmodel_mode},{decision.cpu_governor}"
+        )
+    return 0
+
+
+def cmd_emit_workload(args: argparse.Namespace) -> int:
+    path: pathlib.Path = args.path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = [
+        f"busy={1 if args.busy else 0}",
+        f"fps={args.fps:.3f}",
+        f"phase={args.phase}",
+        f"updated_unix={int(time.time())}",
+    ]
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("\n".join(body) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    print(f"wrote {path}")
+    return 0
+
+
+def _maybe_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="ThermAgent Lab helper for policy validation, simulation and workload hints")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("validate", help="validate and print a policy")
+    p.add_argument("policy", type=pathlib.Path)
+    p.set_defaults(func=cmd_validate)
+
+    p = sub.add_parser("simulate", help="simulate policy decisions from a JSONL trace")
+    p.add_argument("policy", type=pathlib.Path)
+    p.add_argument("--trace", type=pathlib.Path, required=True)
+    p.set_defaults(func=cmd_simulate)
+
+    p = sub.add_parser("emit-workload", help="write /run workload hint file for the daemon")
+    p.add_argument("--path", type=pathlib.Path, default=DEFAULT_WORKLOAD_PATH)
+    p.add_argument("--busy", type=int, choices=(0, 1), required=True)
+    p.add_argument("--fps", type=float, required=True)
+    p.add_argument("--phase", default="vision")
+    p.set_defaults(func=cmd_emit_workload)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except Exception as exc:  # noqa: BLE001 - CLI should show concise failures
+        print(f"thermagentctl: error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

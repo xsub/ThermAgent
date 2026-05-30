@@ -1,0 +1,11 @@
+# ThermAgent Yocto local.conf fragment
+# Reference platform: Jetson Nano-class / L4T R32.x, e.g. OE4T kirkstone-l4t-r32.7.x.
+
+DISTRO_FEATURES:append = " systemd"
+VIRTUAL-RUNTIME_init_manager = "systemd"
+VIRTUAL-RUNTIME_initscripts = ""
+
+IMAGE_INSTALL:append = " packagegroup-thermagent"
+
+# Optional: keep images smaller while preserving the Rust daemon.
+EXTRA_IMAGE_FEATURES ?= "debug-tweaks"

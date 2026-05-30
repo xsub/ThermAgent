@@ -1,0 +1,28 @@
+[Unit]
+Description=ThermAgent Edge adaptive thermal and power policy daemon
+Documentation=https://github.com/<org>/thermagent
+After=multi-user.target
+ConditionPathExists=/etc/thermagent/policy.d/jetson-nano-lite.policy
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/sbin/thermagentd --config /etc/thermagent/policy.d/jetson-nano-lite.policy
+Restart=on-failure
+RestartSec=3s
+
+# The daemon needs controlled writes to sysfs and nvpmodel execution.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/sys/devices/system/cpu /run/thermagent /var/lib/thermagent
+ReadOnlyPaths=/sys/class/thermal /sys/class/devfreq /sys/bus/i2c/drivers/ina3221x
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

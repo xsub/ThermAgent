@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://thermagent.dev/schemas/thermagent-policy.schema.json",
+  "title": "ThermAgent Policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "sample_interval_ms",
+    "max_temp_c",
+    "critical_temp_c",
+    "min_fps",
+    "workload_stale_after_s",
+    "idle_nvpmodel_mode",
+    "active_nvpmodel_mode",
+    "hot_nvpmodel_mode",
+    "idle_cpu_governor",
+    "active_cpu_governor",
+    "hot_cpu_governor",
+    "nvpmodel_bin",
+    "workload_file",
+    "prometheus_listen"
+  ],
+  "properties": {
+    "name": {"type": "string", "minLength": 1},
+    "sample_interval_ms": {"type": "integer", "minimum": 100},
+    "max_temp_c": {"type": "number"},
+    "critical_temp_c": {"type": "number"},
+    "min_fps": {"type": "number", "minimum": 0},
+    "workload_stale_after_s": {"type": "integer", "minimum": 1},
+    "idle_nvpmodel_mode": {"type": "integer", "minimum": 0},
+    "active_nvpmodel_mode": {"type": "integer", "minimum": 0},
+    "hot_nvpmodel_mode": {"type": "integer", "minimum": 0},
+    "idle_cpu_governor": {"type": "string"},
+    "active_cpu_governor": {"type": "string"},
+    "hot_cpu_governor": {"type": "string"},
+    "nvpmodel_bin": {"type": "string"},
+    "workload_file": {"type": "string"},
+    "prometheus_listen": {"type": "string"}
+  }
+}

@@ -1,0 +1,2 @@
+d /run/thermagent 0755 root root - -
+d /var/lib/thermagent 0755 root root - -

@@ -1,0 +1,16 @@
+apiVersion: thermagent.io/v1alpha1
+kind: ThermAgentPolicy
+metadata:
+  name: jetson-vision-safe
+spec:
+  selector:
+    matchLabels:
+      thermagent.io/profile: jetson-nano
+  policyRef:
+    name: jetson-nano-lite-safe-vision
+  safety:
+    maxTempC: 72
+    criticalTempC: 78
+  workload:
+    minFps: 12
+    phase: vision

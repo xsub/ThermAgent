@@ -1,0 +1,10 @@
+[package]
+name = "thermagentd"
+version = "0.1.0"
+edition = "2021"
+authors = ["ThermAgent contributors"]
+license = "Apache-2.0"
+description = "Local adaptive thermal and power policy daemon for edge-AI Linux devices"
+repository = "https://github.com/<org>/thermagent"
+
+[dependencies]
