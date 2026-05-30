@@ -1,5 +1,7 @@
 # ThermAgent
 
+[![ci](https://github.com/xsub/ThermAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/xsub/ThermAgent/actions/workflows/ci.yml)
+
 **Adaptive thermal and power policy stack for edge-AI Linux devices and GPU nodes.**
 
 ThermAgent is an open-source thermal and power policy stack for AI workloads on Linux. It starts with a small local agent for edge devices and grows into an optional fleet and cluster control plane.
