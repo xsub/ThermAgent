@@ -27,6 +27,12 @@ const REQUIRED_POLICY_KEYS: &[&str] = &[
     "workload_file",
     "prometheus_listen",
 ];
+const OPTIONAL_POLICY_KEYS: &[&str] = &[
+    "thermal_hysteresis_c",
+    "critical_hysteresis_c",
+    "decision_hold_s",
+    "missing_thermal_is_hot",
+];
 
 #[derive(Debug, Clone)]
 struct Policy {
@@ -45,6 +51,10 @@ struct Policy {
     nvpmodel_bin: String,
     workload_file: String,
     prometheus_listen: String,
+    thermal_hysteresis_c: f64,
+    critical_hysteresis_c: f64,
+    decision_hold_s: u64,
+    missing_thermal_is_hot: bool,
 }
 
 impl Default for Policy {
@@ -65,6 +75,10 @@ impl Default for Policy {
             nvpmodel_bin: "/usr/sbin/nvpmodel".to_string(),
             workload_file: "/run/thermagent/workload.metrics".to_string(),
             prometheus_listen: "127.0.0.1:9920".to_string(),
+            thermal_hysteresis_c: 3.0,
+            critical_hysteresis_c: 3.0,
+            decision_hold_s: 5,
+            missing_thermal_is_hot: true,
         }
     }
 }
@@ -104,11 +118,19 @@ struct WorkloadHint {
     stale: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Decision {
     reason: String,
     nvpmodel_mode: u8,
     cpu_governor: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DecisionState {
+    last_decision: Option<Decision>,
+    last_change_unix: u64,
+    thermal_guard_latched: bool,
+    critical_cooldown_latched: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -176,11 +198,12 @@ fn main() {
 
     let mut last_nvpmodel_mode: Option<u8> = None;
     let mut actions_failed: u64 = 0;
+    let mut decision_state = DecisionState::default();
 
     loop {
         let telemetry = collect_telemetry();
         let workload = read_workload_hint(&policy.workload_file, policy.workload_stale_after_s);
-        let decision = decide(&policy, &telemetry, &workload);
+        let decision = decide(&policy, &telemetry, &workload, &mut decision_state);
 
         println!(
             "thermagentd: reason={} temp={:?} fps={:?} active={} nvpmodel={} cpu_governor={}",
@@ -322,6 +345,10 @@ fn read_policy(path: &str) -> Result<Policy, String> {
             "nvpmodel_bin" => policy.nvpmodel_bin = value,
             "workload_file" => policy.workload_file = value,
             "prometheus_listen" => policy.prometheus_listen = value,
+            "thermal_hysteresis_c" => policy.thermal_hysteresis_c = parse_f64(key, &value)?,
+            "critical_hysteresis_c" => policy.critical_hysteresis_c = parse_f64(key, &value)?,
+            "decision_hold_s" => policy.decision_hold_s = parse_u64(key, &value)?,
+            "missing_thermal_is_hot" => policy.missing_thermal_is_hot = parse_bool(key, &value)?,
             unknown => return Err(format!("line {}: unknown key {}", idx + 1, unknown)),
         }
         seen.insert(key.to_string());
@@ -334,6 +361,22 @@ fn read_policy(path: &str) -> Result<Policy, String> {
         .collect();
     if !missing.is_empty() {
         return Err(format!("missing policy keys: {}", missing.join(", ")));
+    }
+    let known: BTreeSet<&str> = REQUIRED_POLICY_KEYS
+        .iter()
+        .chain(OPTIONAL_POLICY_KEYS.iter())
+        .copied()
+        .collect();
+    let unsupported: Vec<&str> = seen
+        .iter()
+        .map(String::as_str)
+        .filter(|key| !known.contains(key))
+        .collect();
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "unsupported policy keys: {}",
+            unsupported.join(", ")
+        ));
     }
     validate_policy(&policy)?;
     Ok(policy)
@@ -360,6 +403,12 @@ fn validate_policy(policy: &Policy) -> Result<(), String> {
     }
     if policy.workload_stale_after_s == 0 {
         return Err("workload_stale_after_s must be >= 1".to_string());
+    }
+    if !policy.thermal_hysteresis_c.is_finite() || policy.thermal_hysteresis_c < 0.0 {
+        return Err("thermal_hysteresis_c must be a finite number >= 0".to_string());
+    }
+    if !policy.critical_hysteresis_c.is_finite() || policy.critical_hysteresis_c < 0.0 {
+        return Err("critical_hysteresis_c must be a finite number >= 0".to_string());
     }
     for (key, value) in [
         ("idle_cpu_governor", &policy.idle_cpu_governor),
@@ -407,6 +456,14 @@ fn parse_f64(key: &str, value: &str) -> Result<f64, String> {
         Ok(parsed)
     } else {
         Err(format!("{} expects finite number, got {}", key, value))
+    }
+}
+
+fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!("{} expects boolean, got {}", key, value)),
     }
 }
 
@@ -631,22 +688,55 @@ fn read_workload_hint(path: &str, stale_after_s: u64) -> WorkloadHint {
     }
 }
 
-fn decide(policy: &Policy, telemetry: &Telemetry, workload: &WorkloadHint) -> Decision {
-    let max_temp = telemetry.max_temp_c.unwrap_or(0.0);
-    if max_temp >= policy.critical_temp_c {
-        return Decision {
-            reason: "critical_cooldown".to_string(),
-            nvpmodel_mode: policy.hot_nvpmodel_mode,
-            cpu_governor: policy.hot_cpu_governor.clone(),
-        };
+fn decide(
+    policy: &Policy,
+    telemetry: &Telemetry,
+    workload: &WorkloadHint,
+    state: &mut DecisionState,
+) -> Decision {
+    let candidate = desired_decision(policy, telemetry, workload, state);
+    hold_decision(policy, telemetry.ts_unix, candidate, state)
+}
+
+fn desired_decision(
+    policy: &Policy,
+    telemetry: &Telemetry,
+    workload: &WorkloadHint,
+    state: &mut DecisionState,
+) -> Decision {
+    if telemetry.max_temp_c.is_none() && policy.missing_thermal_is_hot {
+        state.critical_cooldown_latched = false;
+        state.thermal_guard_latched = true;
+        return hot_decision(policy, "missing_thermal_telemetry");
     }
-    if max_temp >= policy.max_temp_c {
-        return Decision {
-            reason: "thermal_guard".to_string(),
-            nvpmodel_mode: policy.hot_nvpmodel_mode,
-            cpu_governor: policy.hot_cpu_governor.clone(),
-        };
+
+    if let Some(max_temp) = telemetry.max_temp_c {
+        if max_temp >= policy.critical_temp_c {
+            state.critical_cooldown_latched = true;
+            state.thermal_guard_latched = true;
+        } else if state.critical_cooldown_latched
+            && max_temp <= policy.critical_temp_c - policy.critical_hysteresis_c
+        {
+            state.critical_cooldown_latched = false;
+        }
+
+        if state.critical_cooldown_latched {
+            return hot_decision(policy, "critical_cooldown");
+        }
+
+        if max_temp >= policy.max_temp_c {
+            state.thermal_guard_latched = true;
+        } else if state.thermal_guard_latched
+            && max_temp <= policy.max_temp_c - policy.thermal_hysteresis_c
+        {
+            state.thermal_guard_latched = false;
+        }
+
+        if state.thermal_guard_latched {
+            return hot_decision(policy, "thermal_guard");
+        }
     }
+
     if workload.active {
         let fps = workload.fps.unwrap_or(policy.min_fps);
         let reason = if fps < policy.min_fps {
@@ -669,6 +759,43 @@ fn decide(policy: &Policy, telemetry: &Telemetry, workload: &WorkloadHint) -> De
         .to_string(),
         nvpmodel_mode: policy.idle_nvpmodel_mode,
         cpu_governor: policy.idle_cpu_governor.clone(),
+    }
+}
+
+fn hold_decision(
+    policy: &Policy,
+    now_unix: u64,
+    candidate: Decision,
+    state: &mut DecisionState,
+) -> Decision {
+    if let Some(last) = &state.last_decision {
+        let elapsed = now_unix.saturating_sub(state.last_change_unix);
+        let safety_escalation = safety_rank(&candidate.reason) > safety_rank(&last.reason);
+        if candidate != *last && !safety_escalation && elapsed < policy.decision_hold_s {
+            return last.clone();
+        }
+    }
+
+    if state.last_decision.as_ref() != Some(&candidate) {
+        state.last_change_unix = now_unix;
+        state.last_decision = Some(candidate.clone());
+    }
+    candidate
+}
+
+fn hot_decision(policy: &Policy, reason: &str) -> Decision {
+    Decision {
+        reason: reason.to_string(),
+        nvpmodel_mode: policy.hot_nvpmodel_mode,
+        cpu_governor: policy.hot_cpu_governor.clone(),
+    }
+}
+
+fn safety_rank(reason: &str) -> u8 {
+    match reason {
+        "critical_cooldown" | "missing_thermal_telemetry" => 3,
+        "thermal_guard" => 2,
+        _ => 1,
     }
 }
 
@@ -999,6 +1126,7 @@ prometheus_listen: 127.0.0.1:9920
     fn decide_prioritizes_critical_temperature_over_workload() {
         let policy = Policy::default();
         let telemetry = Telemetry {
+            ts_unix: 10,
             max_temp_c: Some(policy.critical_temp_c),
             ..Telemetry::default()
         };
@@ -1008,11 +1136,127 @@ prometheus_listen: 127.0.0.1:9920
             ..WorkloadHint::default()
         };
 
-        let decision = decide(&policy, &telemetry, &workload);
+        let mut state = DecisionState::default();
+        let decision = decide(&policy, &telemetry, &workload, &mut state);
 
         assert_eq!(decision.reason, "critical_cooldown");
         assert_eq!(decision.nvpmodel_mode, policy.hot_nvpmodel_mode);
         assert_eq!(decision.cpu_governor, policy.hot_cpu_governor);
+    }
+
+    #[test]
+    fn decide_keeps_thermal_guard_until_hysteresis_clears() {
+        let policy = Policy::default();
+        let mut state = DecisionState::default();
+        let workload = WorkloadHint {
+            active: true,
+            fps: Some(policy.min_fps + 1.0),
+            ..WorkloadHint::default()
+        };
+
+        let hot = decide(
+            &policy,
+            &Telemetry {
+                ts_unix: 10,
+                max_temp_c: Some(policy.max_temp_c + 0.5),
+                ..Telemetry::default()
+            },
+            &workload,
+            &mut state,
+        );
+        let still_hot = decide(
+            &policy,
+            &Telemetry {
+                ts_unix: 20,
+                max_temp_c: Some(policy.max_temp_c - 1.0),
+                ..Telemetry::default()
+            },
+            &workload,
+            &mut state,
+        );
+        let clear = decide(
+            &policy,
+            &Telemetry {
+                ts_unix: 30,
+                max_temp_c: Some(policy.max_temp_c - policy.thermal_hysteresis_c),
+                ..Telemetry::default()
+            },
+            &workload,
+            &mut state,
+        );
+
+        assert_eq!(hot.reason, "thermal_guard");
+        assert_eq!(still_hot.reason, "thermal_guard");
+        assert_eq!(clear.reason, "active");
+    }
+
+    #[test]
+    fn decide_uses_safe_mode_when_thermal_telemetry_is_missing() {
+        let policy = Policy::default();
+        let mut state = DecisionState::default();
+        let decision = decide(
+            &policy,
+            &Telemetry {
+                ts_unix: 10,
+                max_temp_c: None,
+                ..Telemetry::default()
+            },
+            &WorkloadHint::default(),
+            &mut state,
+        );
+
+        assert_eq!(decision.reason, "missing_thermal_telemetry");
+        assert_eq!(decision.nvpmodel_mode, policy.hot_nvpmodel_mode);
+    }
+
+    #[test]
+    fn decide_holds_non_safety_transitions_briefly() {
+        let policy = Policy {
+            decision_hold_s: 10,
+            ..Policy::default()
+        };
+        let mut state = DecisionState::default();
+        let active = WorkloadHint {
+            active: true,
+            fps: Some(policy.min_fps + 1.0),
+            ..WorkloadHint::default()
+        };
+        let idle = WorkloadHint::default();
+
+        let first = decide(
+            &policy,
+            &Telemetry {
+                ts_unix: 10,
+                max_temp_c: Some(40.0),
+                ..Telemetry::default()
+            },
+            &active,
+            &mut state,
+        );
+        let held = decide(
+            &policy,
+            &Telemetry {
+                ts_unix: 15,
+                max_temp_c: Some(40.0),
+                ..Telemetry::default()
+            },
+            &idle,
+            &mut state,
+        );
+        let released = decide(
+            &policy,
+            &Telemetry {
+                ts_unix: 25,
+                max_temp_c: Some(40.0),
+                ..Telemetry::default()
+            },
+            &idle,
+            &mut state,
+        );
+
+        assert_eq!(first.reason, "active");
+        assert_eq!(held.reason, "active");
+        assert_eq!(released.reason, "idle");
     }
 
     #[test]

@@ -45,7 +45,7 @@ It includes:
 - systemd service with conservative hardening.
 - Jetson Nano Lite reference policy using `nvpmodel` and CPU governors.
 
-The PoC intentionally avoids direct GPU clocks, fan PWM, voltage, device tree and bootloader changes. It starts with safer controls: telemetry, thermal guard, `nvpmodel` and CPU governor selection.
+The PoC intentionally avoids direct GPU clocks, fan PWM, voltage, device tree and bootloader changes. It starts with safer controls: telemetry, thermal guard with hysteresis, `nvpmodel` and CPU governor selection.
 
 ## Quick local checks
 

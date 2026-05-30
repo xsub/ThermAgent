@@ -17,6 +17,15 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+
+def _parse_bool(value: str) -> bool:
+    if value.lower() in {"1", "true", "yes", "on"}:
+        return True
+    if value.lower() in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"expected boolean, got {value!r}")
+
+
 REQUIRED_KEYS = {
     "name": str,
     "sample_interval_ms": int,
@@ -34,6 +43,18 @@ REQUIRED_KEYS = {
     "workload_file": str,
     "prometheus_listen": str,
 }
+OPTIONAL_KEYS = {
+    "thermal_hysteresis_c": float,
+    "critical_hysteresis_c": float,
+    "decision_hold_s": int,
+    "missing_thermal_is_hot": _parse_bool,
+}
+DEFAULTS = {
+    "thermal_hysteresis_c": 3.0,
+    "critical_hysteresis_c": 3.0,
+    "decision_hold_s": 5,
+    "missing_thermal_is_hot": True,
+}
 
 DEFAULT_WORKLOAD_PATH = pathlib.Path("/run/thermagent/workload.metrics")
 DEFAULT_REPORT_FORMAT = "markdown"
@@ -44,6 +65,14 @@ class Decision:
     reason: str
     nvpmodel_mode: int
     cpu_governor: str
+
+
+@dataclass
+class DecisionState:
+    last_decision: Decision | None = None
+    last_change_s: float = 0.0
+    thermal_guard_latched: bool = False
+    critical_cooldown_latched: bool = False
 
 
 def strip_comment(line: str) -> str:
@@ -71,7 +100,8 @@ def parse_policy(path: pathlib.Path) -> dict[str, Any]:
             raise ValueError(f"{path}:{lineno}: expected 'key: value' or 'key = value'")
         data[key.strip()] = unquote(value)
 
-    unknown = sorted(set(data) - set(REQUIRED_KEYS))
+    known_keys = set(REQUIRED_KEYS) | set(OPTIONAL_KEYS)
+    unknown = sorted(set(data) - known_keys)
     if unknown:
         raise ValueError(f"unknown policy keys: {', '.join(unknown)}")
 
@@ -85,6 +115,16 @@ def parse_policy(path: pathlib.Path) -> dict[str, Any]:
             typed[key] = typ(data[key])
         except Exception as exc:  # noqa: BLE001 - human-facing validation tool
             raise ValueError(f"{key}: cannot convert {data[key]!r} to {typ.__name__}") from exc
+    for key, default in DEFAULTS.items():
+        typed[key] = default
+    for key, typ in OPTIONAL_KEYS.items():
+        if key not in data:
+            continue
+        try:
+            typed[key] = typ(data[key])
+        except Exception as exc:  # noqa: BLE001 - human-facing validation tool
+            name = getattr(typ, "__name__", str(typ))
+            raise ValueError(f"{key}: cannot convert {data[key]!r} to {name}") from exc
 
     if typed["critical_temp_c"] <= typed["max_temp_c"]:
         raise ValueError("critical_temp_c must be greater than max_temp_c")
@@ -94,6 +134,12 @@ def parse_policy(path: pathlib.Path) -> dict[str, Any]:
         raise ValueError("workload_stale_after_s must be >= 1")
     if typed["min_fps"] < 0:
         raise ValueError("min_fps must be >= 0")
+    if typed["thermal_hysteresis_c"] < 0:
+        raise ValueError("thermal_hysteresis_c must be >= 0")
+    if typed["critical_hysteresis_c"] < 0:
+        raise ValueError("critical_hysteresis_c must be >= 0")
+    if typed["decision_hold_s"] < 0:
+        raise ValueError("decision_hold_s must be >= 0")
     for key, value in typed.items():
         if isinstance(value, float) and not math.isfinite(value):
             raise ValueError(f"{key} must be a finite number")
@@ -125,16 +171,77 @@ def validate_schema_subset(policy: dict[str, Any], schema_path: pathlib.Path) ->
             raise ValueError(f"{key}: value is shorter than schema minLength {rules['minLength']}")
 
 
-def decide(policy: dict[str, Any], temp_c: float | None, active: bool, fps: float | None, stale: bool = False) -> Decision:
-    max_temp = temp_c or 0.0
-    if max_temp >= policy["critical_temp_c"]:
-        return Decision("critical_cooldown", policy["hot_nvpmodel_mode"], policy["hot_cpu_governor"])
-    if max_temp >= policy["max_temp_c"]:
-        return Decision("thermal_guard", policy["hot_nvpmodel_mode"], policy["hot_cpu_governor"])
+def decide(
+    policy: dict[str, Any],
+    temp_c: float | None,
+    active: bool,
+    fps: float | None,
+    stale: bool = False,
+    state: DecisionState | None = None,
+    t_s: float | None = None,
+) -> Decision:
+    if state is None:
+        state = DecisionState()
+    candidate = desired_decision(policy, temp_c=temp_c, active=active, fps=fps, stale=stale, state=state)
+    return hold_decision(policy, candidate, state, t_s or 0.0)
+
+
+def desired_decision(
+    policy: dict[str, Any],
+    temp_c: float | None,
+    active: bool,
+    fps: float | None,
+    stale: bool,
+    state: DecisionState,
+) -> Decision:
+    if temp_c is None and policy["missing_thermal_is_hot"]:
+        state.critical_cooldown_latched = False
+        state.thermal_guard_latched = True
+        return Decision("missing_thermal_telemetry", policy["hot_nvpmodel_mode"], policy["hot_cpu_governor"])
+
+    if temp_c is not None:
+        if temp_c >= policy["critical_temp_c"]:
+            state.critical_cooldown_latched = True
+            state.thermal_guard_latched = True
+        elif state.critical_cooldown_latched and temp_c <= policy["critical_temp_c"] - policy["critical_hysteresis_c"]:
+            state.critical_cooldown_latched = False
+
+        if state.critical_cooldown_latched:
+            return Decision("critical_cooldown", policy["hot_nvpmodel_mode"], policy["hot_cpu_governor"])
+
+        if temp_c >= policy["max_temp_c"]:
+            state.thermal_guard_latched = True
+        elif state.thermal_guard_latched and temp_c <= policy["max_temp_c"] - policy["thermal_hysteresis_c"]:
+            state.thermal_guard_latched = False
+
+        if state.thermal_guard_latched:
+            return Decision("thermal_guard", policy["hot_nvpmodel_mode"], policy["hot_cpu_governor"])
+
     if active:
         reason = "active_below_fps_target" if (fps is not None and fps < policy["min_fps"]) else "active"
         return Decision(reason, policy["active_nvpmodel_mode"], policy["active_cpu_governor"])
     return Decision("idle_or_no_workload_hint" if stale else "idle", policy["idle_nvpmodel_mode"], policy["idle_cpu_governor"])
+
+
+def hold_decision(policy: dict[str, Any], candidate: Decision, state: DecisionState, t_s: float) -> Decision:
+    if state.last_decision is not None:
+        elapsed = max(0.0, t_s - state.last_change_s)
+        safety_escalation = safety_rank(candidate.reason) > safety_rank(state.last_decision.reason)
+        if candidate != state.last_decision and not safety_escalation and elapsed < policy["decision_hold_s"]:
+            return state.last_decision
+
+    if state.last_decision != candidate:
+        state.last_decision = candidate
+        state.last_change_s = t_s
+    return candidate
+
+
+def safety_rank(reason: str) -> int:
+    if reason in {"critical_cooldown", "missing_thermal_telemetry"}:
+        return 3
+    if reason == "thermal_guard":
+        return 2
+    return 1
 
 
 def load_trace(path: pathlib.Path) -> list[dict[str, Any]]:
@@ -154,15 +261,17 @@ def load_trace(path: pathlib.Path) -> list[dict[str, Any]]:
 
 def simulate_rows(policy: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out = []
+    state = DecisionState()
     for row in rows:
         temp_c = _maybe_float(row.get("temp_c"))
+        t_s = _maybe_float(row.get("t_s"))
         fps = _maybe_float(row.get("fps"))
         active = bool(row.get("active", False))
         stale = bool(row.get("stale", False))
-        decision = decide(policy, temp_c=temp_c, active=active, fps=fps, stale=stale)
+        decision = decide(policy, temp_c=temp_c, active=active, fps=fps, stale=stale, state=state, t_s=t_s)
         out.append(
             {
-                "t_s": _maybe_float(row.get("t_s")),
+                "t_s": t_s,
                 "temp_c": temp_c,
                 "fps": fps,
                 "active": active,

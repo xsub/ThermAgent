@@ -7,6 +7,10 @@ sample_interval_ms: 1000
 # Jetson Nano passive heatsink safety guard. Adjust after real thermal tests.
 max_temp_c: 72.0
 critical_temp_c: 78.0
+thermal_hysteresis_c: 3.0
+critical_hysteresis_c: 3.0
+decision_hold_s: 5
+missing_thermal_is_hot: true
 
 # Vision workload target. Python tool writes fps into workload_file.
 min_fps: 12.0

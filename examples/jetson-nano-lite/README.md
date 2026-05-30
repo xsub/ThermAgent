@@ -7,7 +7,8 @@ It uses conservative controls:
 - `nvpmodel` mode 1 for idle and thermal guard,
 - `nvpmodel` mode 0 for active vision workload,
 - CPU governor selection,
-- local thermal limits.
+- local thermal limits,
+- thermal hysteresis and short decision hold to avoid rapid mode flapping.
 
 Run locally:
 

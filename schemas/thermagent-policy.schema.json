@@ -36,6 +36,10 @@
     "hot_cpu_governor": {"type": "string"},
     "nvpmodel_bin": {"type": "string"},
     "workload_file": {"type": "string"},
-    "prometheus_listen": {"type": "string"}
+    "prometheus_listen": {"type": "string"},
+    "thermal_hysteresis_c": {"type": "number", "minimum": 0},
+    "critical_hysteresis_c": {"type": "number", "minimum": 0},
+    "decision_hold_s": {"type": "integer", "minimum": 0},
+    "missing_thermal_is_hot": {"type": "boolean"}
   }
 }
