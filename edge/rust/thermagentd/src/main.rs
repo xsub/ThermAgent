@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -10,6 +10,23 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_POLICY: &str = "/etc/thermagent/policy.d/jetson-nano-lite.policy";
+const REQUIRED_POLICY_KEYS: &[&str] = &[
+    "name",
+    "sample_interval_ms",
+    "max_temp_c",
+    "critical_temp_c",
+    "min_fps",
+    "workload_stale_after_s",
+    "idle_nvpmodel_mode",
+    "active_nvpmodel_mode",
+    "hot_nvpmodel_mode",
+    "idle_cpu_governor",
+    "active_cpu_governor",
+    "hot_cpu_governor",
+    "nvpmodel_bin",
+    "workload_file",
+    "prometheus_listen",
+];
 
 #[derive(Debug, Clone)]
 struct Policy {
@@ -101,12 +118,16 @@ struct SharedMetrics {
     reason: String,
     dry_run: bool,
     max_temp_c: Option<f64>,
+    thermal_zones: Vec<ThermalZone>,
     avg_cpu_freq_khz: Option<f64>,
+    cpu_governors: BTreeMap<String, String>,
     gpu_cur_freq_hz: Option<u64>,
     gpu_max_freq_hz: Option<u64>,
     power_mw_sum: Option<f64>,
     workload_active: bool,
     workload_fps: Option<f64>,
+    workload_phase: Option<String>,
+    workload_stale: bool,
     nvpmodel_mode: Option<u8>,
     cpu_governor: Option<String>,
     actions_failed: u64,
@@ -117,7 +138,10 @@ fn main() {
     let mut policy = match read_policy(&args.config) {
         Ok(p) => p,
         Err(err) => {
-            eprintln!("thermagentd: failed to read policy {}: {}", args.config, err);
+            eprintln!(
+                "thermagentd: failed to read policy {}: {}",
+                args.config, err
+            );
             std::process::exit(2);
         }
     };
@@ -183,12 +207,16 @@ fn main() {
                 reason: decision.reason.clone(),
                 dry_run: args.dry_run,
                 max_temp_c: telemetry.max_temp_c,
+                thermal_zones: telemetry.thermal_zones,
                 avg_cpu_freq_khz: telemetry.avg_cpu_freq_khz,
+                cpu_governors: telemetry.cpu_governors,
                 gpu_cur_freq_hz: telemetry.gpu_cur_freq_hz,
                 gpu_max_freq_hz: telemetry.gpu_max_freq_hz,
                 power_mw_sum: telemetry.power_mw_sum,
                 workload_active: workload.active,
                 workload_fps: workload.fps,
+                workload_phase: workload.phase,
+                workload_stale: workload.stale,
                 nvpmodel_mode: Some(decision.nvpmodel_mode),
                 cpu_governor: Some(decision.cpu_governor.clone()),
                 actions_failed,
@@ -224,7 +252,9 @@ fn parse_args_or_exit() -> Args {
                     std::process::exit(2);
                 }));
             }
-            "--prometheus" => args.prometheus_listen = Some(required_value(&mut iter, "--prometheus")),
+            "--prometheus" => {
+                args.prometheus_listen = Some(required_value(&mut iter, "--prometheus"))
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -258,6 +288,7 @@ fn print_help() {
 fn read_policy(path: &str) -> Result<Policy, String> {
     let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut policy = Policy::default();
+    let mut seen = BTreeSet::new();
 
     for (idx, raw_line) in content.lines().enumerate() {
         let no_comment = raw_line.split('#').next().unwrap_or("").trim();
@@ -293,17 +324,63 @@ fn read_policy(path: &str) -> Result<Policy, String> {
             "prometheus_listen" => policy.prometheus_listen = value,
             unknown => return Err(format!("line {}: unknown key {}", idx + 1, unknown)),
         }
+        seen.insert(key.to_string());
     }
 
+    let missing: Vec<&str> = REQUIRED_POLICY_KEYS
+        .iter()
+        .copied()
+        .filter(|key| !seen.contains(*key))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!("missing policy keys: {}", missing.join(", ")));
+    }
+    validate_policy(&policy)?;
+    Ok(policy)
+}
+
+fn validate_policy(policy: &Policy) -> Result<(), String> {
+    if policy.name.trim().is_empty() {
+        return Err("name must not be empty".to_string());
+    }
+    if policy.sample_interval_ms < 100 {
+        return Err("sample_interval_ms must be >= 100".to_string());
+    }
+    if !policy.max_temp_c.is_finite() {
+        return Err("max_temp_c must be a finite number".to_string());
+    }
+    if !policy.critical_temp_c.is_finite() {
+        return Err("critical_temp_c must be a finite number".to_string());
+    }
     if policy.critical_temp_c <= policy.max_temp_c {
         return Err("critical_temp_c must be greater than max_temp_c".to_string());
     }
-    Ok(policy)
+    if !policy.min_fps.is_finite() || policy.min_fps < 0.0 {
+        return Err("min_fps must be a finite number >= 0".to_string());
+    }
+    if policy.workload_stale_after_s == 0 {
+        return Err("workload_stale_after_s must be >= 1".to_string());
+    }
+    for (key, value) in [
+        ("idle_cpu_governor", &policy.idle_cpu_governor),
+        ("active_cpu_governor", &policy.active_cpu_governor),
+        ("hot_cpu_governor", &policy.hot_cpu_governor),
+        ("nvpmodel_bin", &policy.nvpmodel_bin),
+        ("workload_file", &policy.workload_file),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!("{} must not be empty", key));
+        }
+    }
+    Ok(())
 }
 
 fn unquote(value: &str) -> String {
     let bytes = value.as_bytes();
-    if bytes.len() >= 2 && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"') || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')) {
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
         value[1..value.len() - 1].to_string()
     } else {
         value.to_string()
@@ -311,15 +388,26 @@ fn unquote(value: &str) -> String {
 }
 
 fn parse_u64(key: &str, value: &str) -> Result<u64, String> {
-    value.parse::<u64>().map_err(|_| format!("{} expects unsigned integer, got {}", key, value))
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{} expects unsigned integer, got {}", key, value))
 }
 
 fn parse_u8(key: &str, value: &str) -> Result<u8, String> {
-    value.parse::<u8>().map_err(|_| format!("{} expects u8 integer, got {}", key, value))
+    value
+        .parse::<u8>()
+        .map_err(|_| format!("{} expects u8 integer, got {}", key, value))
 }
 
 fn parse_f64(key: &str, value: &str) -> Result<f64, String> {
-    value.parse::<f64>().map_err(|_| format!("{} expects number, got {}", key, value))
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| format!("{} expects number, got {}", key, value))?;
+    if parsed.is_finite() {
+        Ok(parsed)
+    } else {
+        Err(format!("{} expects finite number, got {}", key, value))
+    }
 }
 
 fn collect_telemetry() -> Telemetry {
@@ -362,8 +450,15 @@ fn read_thermal_zones() -> Vec<ThermalZone> {
         let path = entry.path();
         let zone_type = read_trim(path.join("type")).unwrap_or(name);
         if let Some(raw_temp) = read_f64_file(path.join("temp")) {
-            let temp_c = if raw_temp > 1000.0 { raw_temp / 1000.0 } else { raw_temp };
-            zones.push(ThermalZone { name: zone_type, temp_c });
+            let temp_c = if raw_temp > 1000.0 {
+                raw_temp / 1000.0
+            } else {
+                raw_temp
+            };
+            zones.push(ThermalZone {
+                name: zone_type,
+                temp_c,
+            });
         }
     }
     zones
@@ -417,7 +512,10 @@ fn read_gpu_devfreq() -> (Option<u64>, Option<u64>) {
     for entry in entries.flatten() {
         let path = entry.path();
         let file_name = entry.file_name().to_string_lossy().to_string();
-        let target = fs::read_link(&path).ok().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        let target = fs::read_link(&path)
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
         let dev_name = read_trim(path.join("name")).unwrap_or_default();
         let haystack = format!("{} {} {}", file_name, target, dev_name).to_lowercase();
         if haystack.contains("gpu") || haystack.contains("gbus") || haystack.contains("57000000") {
@@ -446,7 +544,11 @@ fn read_ina3221_power_mw() -> Option<f64> {
             count += 1;
         }
     }
-    if count == 0 { None } else { Some(total_mw) }
+    if count == 0 {
+        None
+    } else {
+        Some(total_mw)
+    }
 }
 
 fn collect_power_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -472,7 +574,12 @@ fn read_workload_hint(path: &str, stale_after_s: u64) -> WorkloadHint {
     let p = Path::new(path);
     let metadata = match fs::metadata(p) {
         Ok(m) => m,
-        Err(_) => return WorkloadHint { stale: true, ..WorkloadHint::default() },
+        Err(_) => {
+            return WorkloadHint {
+                stale: true,
+                ..WorkloadHint::default()
+            }
+        }
     };
 
     let stale = metadata
@@ -484,7 +591,12 @@ fn read_workload_hint(path: &str, stale_after_s: u64) -> WorkloadHint {
 
     let content = match fs::read_to_string(p) {
         Ok(c) => c,
-        Err(_) => return WorkloadHint { stale, ..WorkloadHint::default() },
+        Err(_) => {
+            return WorkloadHint {
+                stale,
+                ..WorkloadHint::default()
+            }
+        }
     };
 
     let mut kv = BTreeMap::new();
@@ -511,7 +623,12 @@ fn read_workload_hint(path: &str, stale_after_s: u64) -> WorkloadHint {
     let phase = kv.get("phase").cloned();
     let active = !stale && (busy || fps.unwrap_or(0.0) > 0.1);
 
-    WorkloadHint { active, fps, phase, stale }
+    WorkloadHint {
+        active,
+        fps,
+        phase,
+        stale,
+    }
 }
 
 fn decide(policy: &Policy, telemetry: &Telemetry, workload: &WorkloadHint) -> Decision {
@@ -544,13 +661,23 @@ fn decide(policy: &Policy, telemetry: &Telemetry, workload: &WorkloadHint) -> De
         };
     }
     Decision {
-        reason: if workload.stale { "idle_or_no_workload_hint" } else { "idle" }.to_string(),
+        reason: if workload.stale {
+            "idle_or_no_workload_hint"
+        } else {
+            "idle"
+        }
+        .to_string(),
         nvpmodel_mode: policy.idle_nvpmodel_mode,
         cpu_governor: policy.idle_cpu_governor.clone(),
     }
 }
 
-fn apply_decision(policy: &Policy, decision: &Decision, dry_run: bool, last_nvpmodel_mode: &mut Option<u8>) -> Result<(), String> {
+fn apply_decision(
+    policy: &Policy,
+    decision: &Decision,
+    dry_run: bool,
+    last_nvpmodel_mode: &mut Option<u8>,
+) -> Result<(), String> {
     set_cpu_governor(&decision.cpu_governor, dry_run)?;
 
     if *last_nvpmodel_mode != Some(decision.nvpmodel_mode) {
@@ -577,7 +704,11 @@ fn set_cpu_governor(governor: &str, dry_run: bool) -> Result<(), String> {
         }
         attempted += 1;
         if dry_run {
-            println!("thermagentd: dry-run write {} -> {}", path.display(), governor);
+            println!(
+                "thermagentd: dry-run write {} -> {}",
+                path.display(),
+                governor
+            );
         } else if let Err(err) = fs::write(&path, format!("{}\n", governor)) {
             failures.push(format!("{}: {}", path.display(), err));
         }
@@ -599,7 +730,10 @@ fn set_cpu_governor(governor: &str, dry_run: bool) -> Result<(), String> {
 
 fn set_nvpmodel(policy: &Policy, mode: u8, dry_run: bool) -> Result<(), String> {
     if dry_run {
-        println!("thermagentd: dry-run exec {} -m {}", policy.nvpmodel_bin, mode);
+        println!(
+            "thermagentd: dry-run exec {} -m {}",
+            policy.nvpmodel_bin, mode
+        );
         return Ok(());
     }
 
@@ -612,13 +746,19 @@ fn set_nvpmodel(policy: &Policy, mode: u8, dry_run: bool) -> Result<(), String> 
     if status.success() {
         Ok(())
     } else {
-        Err(format!("{} -m {} exited with {}", policy.nvpmodel_bin, mode, status))
+        Err(format!(
+            "{} -m {} exited with {}",
+            policy.nvpmodel_bin, mode, status
+        ))
     }
 }
 
 fn serve_metrics(addr: String, shared: Arc<Mutex<SharedMetrics>>) -> Result<(), String> {
     let listener = TcpListener::bind(&addr).map_err(|e| format!("bind {}: {}", addr, e))?;
-    println!("thermagentd: prometheus metrics listening on http://{}/metrics", addr);
+    println!(
+        "thermagentd: prometheus metrics listening on http://{}/metrics",
+        addr
+    );
     for stream in listener.incoming() {
         match stream {
             Ok(mut s) => {
@@ -641,7 +781,9 @@ fn respond_metrics(stream: &mut TcpStream, m: &SharedMetrics) -> Result<(), Stri
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n{}",
         body.len(), body
     );
-    stream.write_all(response.as_bytes()).map_err(|e| e.to_string())
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|e| e.to_string())
 }
 
 fn render_prometheus(m: &SharedMetrics) -> String {
@@ -656,19 +798,94 @@ fn render_prometheus(m: &SharedMetrics) -> String {
     out.push_str("# HELP thermagent_timestamp_seconds Last telemetry sample timestamp.\n");
     out.push_str("# TYPE thermagent_timestamp_seconds gauge\n");
     out.push_str(&format!("thermagent_timestamp_seconds {}\n", m.ts_unix));
-    push_opt(&mut out, "thermagent_temperature_celsius", "Max thermal-zone temperature.", m.max_temp_c);
-    push_opt(&mut out, "thermagent_cpu_freq_khz", "Average CPU frequency from cpufreq.", m.avg_cpu_freq_khz);
-    push_opt(&mut out, "thermagent_gpu_cur_freq_hz", "GPU-like devfreq current frequency.", m.gpu_cur_freq_hz.map(|v| v as f64));
-    push_opt(&mut out, "thermagent_gpu_max_freq_hz", "GPU-like devfreq max frequency.", m.gpu_max_freq_hz.map(|v| v as f64));
-    push_opt(&mut out, "thermagent_power_mw_sum", "Sum of discovered INA3221 power input files.", m.power_mw_sum);
+    push_opt(
+        &mut out,
+        "thermagent_temperature_celsius",
+        "Max thermal-zone temperature.",
+        m.max_temp_c,
+    );
+    if !m.thermal_zones.is_empty() {
+        out.push_str("# HELP thermagent_thermal_zone_temperature_celsius Thermal-zone temperature by zone.\n");
+        out.push_str("# TYPE thermagent_thermal_zone_temperature_celsius gauge\n");
+        for zone in &m.thermal_zones {
+            out.push_str(&format!(
+                "thermagent_thermal_zone_temperature_celsius{{zone=\"{}\"}} {}\n",
+                escape_label(&zone.name),
+                zone.temp_c
+            ));
+        }
+    }
+    push_opt(
+        &mut out,
+        "thermagent_cpu_freq_khz",
+        "Average CPU frequency from cpufreq.",
+        m.avg_cpu_freq_khz,
+    );
+    if !m.cpu_governors.is_empty() {
+        out.push_str(
+            "# HELP thermagent_cpu_scaling_governor_info Current CPU cpufreq governor labels.\n",
+        );
+        out.push_str("# TYPE thermagent_cpu_scaling_governor_info gauge\n");
+        for (cpu, governor) in &m.cpu_governors {
+            out.push_str(&format!(
+                "thermagent_cpu_scaling_governor_info{{cpu=\"{}\",governor=\"{}\"}} 1\n",
+                escape_label(cpu),
+                escape_label(governor)
+            ));
+        }
+    }
+    push_opt(
+        &mut out,
+        "thermagent_gpu_cur_freq_hz",
+        "GPU-like devfreq current frequency.",
+        m.gpu_cur_freq_hz.map(|v| v as f64),
+    );
+    push_opt(
+        &mut out,
+        "thermagent_gpu_max_freq_hz",
+        "GPU-like devfreq max frequency.",
+        m.gpu_max_freq_hz.map(|v| v as f64),
+    );
+    push_opt(
+        &mut out,
+        "thermagent_power_mw_sum",
+        "Sum of discovered INA3221 power input files.",
+        m.power_mw_sum,
+    );
     out.push_str("# HELP thermagent_workload_active Workload hint active flag.\n");
     out.push_str("# TYPE thermagent_workload_active gauge\n");
-    out.push_str(&format!("thermagent_workload_active {}\n", if m.workload_active { 1 } else { 0 }));
-    push_opt(&mut out, "thermagent_workload_fps", "Workload hint FPS.", m.workload_fps);
+    out.push_str(&format!(
+        "thermagent_workload_active {}\n",
+        if m.workload_active { 1 } else { 0 }
+    ));
+    push_opt(
+        &mut out,
+        "thermagent_workload_fps",
+        "Workload hint FPS.",
+        m.workload_fps,
+    );
+    out.push_str("# HELP thermagent_workload_stale Workload hint staleness flag.\n");
+    out.push_str("# TYPE thermagent_workload_stale gauge\n");
+    out.push_str(&format!(
+        "thermagent_workload_stale {}\n",
+        if m.workload_stale { 1 } else { 0 }
+    ));
+    if let Some(phase) = &m.workload_phase {
+        out.push_str("# HELP thermagent_workload_phase_info Workload phase label from hint.\n");
+        out.push_str("# TYPE thermagent_workload_phase_info gauge\n");
+        out.push_str(&format!(
+            "thermagent_workload_phase_info{{phase=\"{}\"}} 1\n",
+            escape_label(phase)
+        ));
+    }
     if let Some(mode) = m.nvpmodel_mode {
         out.push_str("# HELP thermagent_nvpmodel_mode Desired Jetson nvpmodel mode.\n");
         out.push_str("# TYPE thermagent_nvpmodel_mode gauge\n");
-        out.push_str(&format!("thermagent_nvpmodel_mode{{reason=\"{}\"}} {}\n", escape_label(&m.reason), mode));
+        out.push_str(&format!(
+            "thermagent_nvpmodel_mode{{reason=\"{}\"}} {}\n",
+            escape_label(&m.reason),
+            mode
+        ));
     }
     if let Some(governor) = &m.cpu_governor {
         out.push_str("# HELP thermagent_cpu_governor_info Desired CPU governor label.\n");
@@ -681,7 +898,10 @@ fn render_prometheus(m: &SharedMetrics) -> String {
     }
     out.push_str("# HELP thermagent_actions_failed_total Failed action attempts.\n");
     out.push_str("# TYPE thermagent_actions_failed_total counter\n");
-    out.push_str(&format!("thermagent_actions_failed_total {}\n", m.actions_failed));
+    out.push_str(&format!(
+        "thermagent_actions_failed_total {}\n",
+        m.actions_failed
+    ));
     out
 }
 
@@ -694,15 +914,24 @@ fn push_opt(out: &mut String, name: &str, help: &str, value: Option<f64>) {
 }
 
 fn escape_label(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0)).as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs()
 }
 
 fn read_trim<P: AsRef<Path>>(path: P) -> Option<String> {
-    fs::read_to_string(path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn read_f64_file<P: AsRef<Path>>(path: P) -> Option<f64> {
@@ -711,4 +940,107 @@ fn read_f64_file<P: AsRef<Path>>(path: P) -> Option<f64> {
 
 fn read_u64_file<P: AsRef<Path>>(path: P) -> Option<u64> {
     read_trim(path).and_then(|s| s.parse::<u64>().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_policy_text() -> &'static str {
+        r#"
+name: jetson-nano-lite-safe-vision
+sample_interval_ms: 1000
+max_temp_c: 72.0
+critical_temp_c: 78.0
+min_fps: 12.0
+workload_stale_after_s: 15
+idle_nvpmodel_mode: 1
+active_nvpmodel_mode: 0
+hot_nvpmodel_mode: 1
+idle_cpu_governor: schedutil
+active_cpu_governor: schedutil
+hot_cpu_governor: powersave
+nvpmodel_bin: /usr/sbin/nvpmodel
+workload_file: /run/thermagent/workload.metrics
+prometheus_listen: 127.0.0.1:9920
+"#
+    }
+
+    fn write_temp_policy(name: &str, body: &str) -> PathBuf {
+        let mut path = env::temp_dir();
+        path.push(format!(
+            "thermagentd-{}-{}.policy",
+            name,
+            std::process::id()
+        ));
+        fs::write(&path, body).expect("write temp policy");
+        path
+    }
+
+    #[test]
+    fn read_policy_rejects_missing_required_keys() {
+        let path = write_temp_policy("missing", "name: incomplete\n");
+        let err = read_policy(path.to_str().expect("utf-8 path")).expect_err("policy should fail");
+        let _ = fs::remove_file(path);
+        assert!(err.contains("missing policy keys"));
+        assert!(err.contains("sample_interval_ms"));
+    }
+
+    #[test]
+    fn read_policy_accepts_complete_policy() {
+        let path = write_temp_policy("complete", sample_policy_text());
+        let policy = read_policy(path.to_str().expect("utf-8 path")).expect("policy should parse");
+        let _ = fs::remove_file(path);
+        assert_eq!(policy.name, "jetson-nano-lite-safe-vision");
+        assert_eq!(policy.hot_cpu_governor, "powersave");
+    }
+
+    #[test]
+    fn decide_prioritizes_critical_temperature_over_workload() {
+        let policy = Policy::default();
+        let telemetry = Telemetry {
+            max_temp_c: Some(policy.critical_temp_c),
+            ..Telemetry::default()
+        };
+        let workload = WorkloadHint {
+            active: true,
+            fps: Some(policy.min_fps + 30.0),
+            ..WorkloadHint::default()
+        };
+
+        let decision = decide(&policy, &telemetry, &workload);
+
+        assert_eq!(decision.reason, "critical_cooldown");
+        assert_eq!(decision.nvpmodel_mode, policy.hot_nvpmodel_mode);
+        assert_eq!(decision.cpu_governor, policy.hot_cpu_governor);
+    }
+
+    #[test]
+    fn prometheus_metrics_include_collected_telemetry() {
+        let mut cpu_governors = BTreeMap::new();
+        cpu_governors.insert("cpu0".to_string(), "schedutil".to_string());
+        let metrics = SharedMetrics {
+            policy_name: "jetson".to_string(),
+            thermal_zones: vec![ThermalZone {
+                name: "CPU-therm".to_string(),
+                temp_c: 64.5,
+            }],
+            cpu_governors,
+            workload_active: true,
+            workload_phase: Some("vision".to_string()),
+            workload_stale: false,
+            ..SharedMetrics::default()
+        };
+
+        let body = render_prometheus(&metrics);
+
+        assert!(
+            body.contains("thermagent_thermal_zone_temperature_celsius{zone=\"CPU-therm\"} 64.5")
+        );
+        assert!(body.contains(
+            "thermagent_cpu_scaling_governor_info{cpu=\"cpu0\",governor=\"schedutil\"} 1"
+        ));
+        assert!(body.contains("thermagent_workload_phase_info{phase=\"vision\"} 1"));
+        assert!(body.contains("thermagent_workload_stale 0"));
+    }
 }
