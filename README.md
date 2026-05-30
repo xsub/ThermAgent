@@ -23,18 +23,6 @@ ThermAgent Edge enforces.
 Local safety always wins.
 ```
 
-## Repository description for GitHub
-
-```text
-Adaptive thermal and power policy stack for edge-AI Linux devices and GPU nodes: Rust edge agent, Python policy lab, Yocto layer, and planned server/operator control plane.
-```
-
-Suggested GitHub topics:
-
-```text
-linux edge-ai power-management thermal-management yocto rust python jetson-nano embedded-linux nvidia-jetson systemd prometheus kubernetes k3s
-```
-
 ## Current PoC
 
 The current PoC targets Jetson Nano Lite / Jetson Nano-class boards.
