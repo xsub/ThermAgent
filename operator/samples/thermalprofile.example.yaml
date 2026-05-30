@@ -1,0 +1,9 @@
+apiVersion: thermagent.io/v1alpha1
+kind: ThermalProfile
+metadata:
+  name: jetson-nano-passive-safe
+spec:
+  maxTempC: 72
+  criticalTempC: 78
+  hotCpuGovernor: powersave
+  hotNvpmodelMode: 1

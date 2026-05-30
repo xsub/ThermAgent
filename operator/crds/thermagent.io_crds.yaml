@@ -1,0 +1,149 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: thermagentpolicies.thermagent.io
+spec:
+  group: thermagent.io
+  scope: Namespaced
+  names:
+    plural: thermagentpolicies
+    singular: thermagentpolicy
+    kind: ThermAgentPolicy
+    shortNames: ["tap"]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: ["policyRef"]
+              properties:
+                selector:
+                  type: object
+                  properties:
+                    matchLabels:
+                      type: object
+                      additionalProperties:
+                        type: string
+                policyRef:
+                  type: object
+                  required: ["name"]
+                  properties:
+                    name:
+                      type: string
+                safety:
+                  type: object
+                  properties:
+                    maxTempC:
+                      type: number
+                    criticalTempC:
+                      type: number
+                workload:
+                  type: object
+                  properties:
+                    minFps:
+                      type: number
+                    phase:
+                      type: string
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: thermalprofiles.thermagent.io
+spec:
+  group: thermagent.io
+  scope: Namespaced
+  names:
+    plural: thermalprofiles
+    singular: thermalprofile
+    kind: ThermalProfile
+    shortNames: ["thp"]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: ["maxTempC", "criticalTempC"]
+              properties:
+                maxTempC:
+                  type: number
+                criticalTempC:
+                  type: number
+                hotCpuGovernor:
+                  type: string
+                hotNvpmodelMode:
+                  type: integer
+                  minimum: 0
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: powerbudgets.thermagent.io
+spec:
+  group: thermagent.io
+  scope: Namespaced
+  names:
+    plural: powerbudgets
+    singular: powerbudget
+    kind: PowerBudget
+    shortNames: ["tpb"]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                idleNvpmodelMode:
+                  type: integer
+                  minimum: 0
+                activeNvpmodelMode:
+                  type: integer
+                  minimum: 0
+                idleCpuGovernor:
+                  type: string
+                activeCpuGovernor:
+                  type: string
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: workloadhints.thermagent.io
+spec:
+  group: thermagent.io
+  scope: Namespaced
+  names:
+    plural: workloadhints
+    singular: workloadhint
+    kind: WorkloadHint
+    shortNames: ["twh"]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                busy:
+                  type: boolean
+                fps:
+                  type: number
+                phase:
+                  type: string

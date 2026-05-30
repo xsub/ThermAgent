@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""ThermAgent Server MVP.
+
+The server is intentionally dependency-free. It stores fleet intent, metrics and
+audit state in a local JSON file and never writes hardware controls directly.
+"""
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import pathlib
+import sys
+import time
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+DEFAULT_STATE_PATH = pathlib.Path("/tmp/thermagent-server-state.json")
+MAX_METRIC_ROWS = 1000
+
+
+def empty_state() -> dict[str, Any]:
+    return {
+        "inventory": {},
+        "policies": {},
+        "rollouts": [],
+        "metrics": [],
+        "audit": [],
+    }
+
+
+class StateStore:
+    def __init__(self, path: pathlib.Path):
+        self.path = path
+        self.state = self._load()
+
+    def _load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return empty_state()
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        state = empty_state()
+        for key in state:
+            state[key] = data.get(key, state[key])
+        return state
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(self.state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(self.path)
+
+    def audit(self, action: str, subject: str, payload: dict[str, Any]) -> None:
+        self.state["audit"].append(
+            {
+                "ts_unix": now_unix(),
+                "action": action,
+                "subject": subject,
+                "payload": payload,
+            }
+        )
+
+    def upsert_inventory(self, payload: dict[str, Any]) -> dict[str, Any]:
+        node_id = str(payload.get("node_id") or payload.get("id") or "").strip()
+        if not node_id:
+            raise ValueError("inventory payload requires node_id")
+        item = {
+            **self.state["inventory"].get(node_id, {}),
+            **payload,
+            "node_id": node_id,
+            "updated_unix": now_unix(),
+        }
+        self.state["inventory"][node_id] = item
+        self.audit("inventory.upsert", node_id, item)
+        self.save()
+        return item
+
+    def upsert_policy(self, payload: dict[str, Any]) -> dict[str, Any]:
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            raise ValueError("policy payload requires name")
+        item = {
+            **payload,
+            "name": name,
+            "local_safety_required": True,
+            "updated_unix": now_unix(),
+        }
+        self.state["policies"][name] = item
+        self.audit("policy.upsert", name, item)
+        self.save()
+        return item
+
+    def create_rollout(self, payload: dict[str, Any]) -> dict[str, Any]:
+        policy = str(payload.get("policy") or payload.get("policy_name") or "").strip()
+        if not policy:
+            raise ValueError("rollout payload requires policy")
+        rollout = {
+            "id": f"rollout-{len(self.state['rollouts']) + 1}",
+            "policy": policy,
+            "selector": payload.get("selector", {}),
+            "status": "pending",
+            "created_unix": now_unix(),
+            "local_safety_required": True,
+        }
+        self.state["rollouts"].append(rollout)
+        self.audit("rollout.create", rollout["id"], rollout)
+        self.save()
+        return rollout
+
+    def ingest_metrics(self, payload: dict[str, Any]) -> dict[str, Any]:
+        node_id = str(payload.get("node_id") or "").strip()
+        if not node_id:
+            raise ValueError("metrics payload requires node_id")
+        row = {
+            "node_id": node_id,
+            "ts_unix": int(payload.get("ts_unix") or now_unix()),
+            "metrics": payload.get("metrics", {}),
+        }
+        self.state["metrics"].append(row)
+        self.state["metrics"] = self.state["metrics"][-MAX_METRIC_ROWS:]
+        self.audit("metrics.ingest", node_id, row)
+        self.save()
+        return row
+
+
+class ThermAgentHandler(BaseHTTPRequestHandler):
+    server_version = "ThermAgentServer/0.1"
+
+    @property
+    def store(self) -> StateStore:
+        return self.server.store  # type: ignore[attr-defined]
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path == "/":
+                self.respond_html(render_index(self.store.state))
+            elif parsed.path == "/healthz":
+                self.respond_json({"ok": True, "ts_unix": now_unix()})
+            elif parsed.path == "/api/v1":
+                self.respond_json(api_index())
+            elif parsed.path == "/api/v1/inventory":
+                self.respond_json(list(self.store.state["inventory"].values()))
+            elif parsed.path == "/api/v1/policies":
+                self.respond_json(list(self.store.state["policies"].values()))
+            elif parsed.path.startswith("/api/v1/policies/"):
+                name = parsed.path.rsplit("/", 1)[-1]
+                policy = self.store.state["policies"].get(name)
+                if policy is None:
+                    self.respond_error(HTTPStatus.NOT_FOUND, "policy not found")
+                else:
+                    self.respond_json(policy)
+            elif parsed.path == "/api/v1/rollouts":
+                self.respond_json(self.store.state["rollouts"])
+            elif parsed.path == "/api/v1/metrics":
+                query = parse_qs(parsed.query)
+                node_id = query.get("node_id", [None])[0]
+                rows = self.store.state["metrics"]
+                if node_id:
+                    rows = [row for row in rows if row.get("node_id") == node_id]
+                self.respond_json(rows)
+            elif parsed.path == "/api/v1/audit":
+                self.respond_json(self.store.state["audit"])
+            else:
+                self.respond_error(HTTPStatus.NOT_FOUND, "not found")
+        except Exception as exc:  # noqa: BLE001 - request boundary
+            self.respond_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        parsed = urlparse(self.path)
+        try:
+            payload = self.read_json()
+            if parsed.path == "/api/v1/inventory":
+                self.respond_json(self.store.upsert_inventory(payload), HTTPStatus.CREATED)
+            elif parsed.path == "/api/v1/policies":
+                self.respond_json(self.store.upsert_policy(payload), HTTPStatus.CREATED)
+            elif parsed.path == "/api/v1/rollouts":
+                self.respond_json(self.store.create_rollout(payload), HTTPStatus.CREATED)
+            elif parsed.path == "/api/v1/metrics":
+                self.respond_json(self.store.ingest_metrics(payload), HTTPStatus.CREATED)
+            else:
+                self.respond_error(HTTPStatus.NOT_FOUND, "not found")
+        except ValueError as exc:
+            self.respond_error(HTTPStatus.BAD_REQUEST, str(exc))
+        except Exception as exc:  # noqa: BLE001 - request boundary
+            self.respond_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+
+    def read_json(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            return {}
+        data = json.loads(self.rfile.read(length).decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("request body must be a JSON object")
+        return data
+
+    def respond_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
+        body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def respond_html(self, body: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+        encoded = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def respond_error(self, status: HTTPStatus, message: str) -> None:
+        self.respond_json({"error": message, "status": status.value}, status)
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        print(f"thermagent-server: {self.address_string()} - {fmt % args}", file=sys.stderr)
+
+
+def api_index() -> dict[str, Any]:
+    return {
+        "service": "thermagent-server",
+        "version": "0.1",
+        "local_safety_model": "server distributes intent; edge enforces",
+        "routes": [
+            "GET /healthz",
+            "GET /api/v1/inventory",
+            "POST /api/v1/inventory",
+            "GET /api/v1/policies",
+            "POST /api/v1/policies",
+            "GET /api/v1/rollouts",
+            "POST /api/v1/rollouts",
+            "GET /api/v1/metrics",
+            "POST /api/v1/metrics",
+            "GET /api/v1/audit",
+        ],
+    }
+
+
+def render_index(state: dict[str, Any]) -> str:
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ThermAgent Server</title>
+  <style>
+    body {{ font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.45; }}
+    code {{ background: #f4f4f4; padding: 0.15rem 0.3rem; }}
+    table {{ border-collapse: collapse; margin-top: 1rem; }}
+    td, th {{ border: 1px solid #ddd; padding: 0.4rem 0.6rem; }}
+  </style>
+</head>
+<body>
+  <h1>ThermAgent Server</h1>
+  <p>Coordinates fleet intent. Local Edge agents enforce safety.</p>
+  <table>
+    <tr><th>inventory</th><td>{len(state["inventory"])}</td></tr>
+    <tr><th>policies</th><td>{len(state["policies"])}</td></tr>
+    <tr><th>rollouts</th><td>{len(state["rollouts"])}</td></tr>
+    <tr><th>metrics</th><td>{len(state["metrics"])}</td></tr>
+    <tr><th>audit</th><td>{len(state["audit"])}</td></tr>
+  </table>
+  <p>API index: <code>GET /api/v1</code></p>
+  <pre>{html.escape(json.dumps(api_index(), indent=2))}</pre>
+</body>
+</html>
+"""
+
+
+def now_unix() -> int:
+    return int(time.time())
+
+
+def parse_listen(value: str) -> tuple[str, int]:
+    if ":" not in value:
+        raise ValueError("--listen must be HOST:PORT")
+    host, port = value.rsplit(":", 1)
+    return host, int(port)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="ThermAgent self-hosted server MVP")
+    parser.add_argument("--listen", default="127.0.0.1:9980")
+    parser.add_argument("--state", type=pathlib.Path, default=DEFAULT_STATE_PATH)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    host, port = parse_listen(args.listen)
+    server = ThreadingHTTPServer((host, port), ThermAgentHandler)
+    server.store = StateStore(args.state)  # type: ignore[attr-defined]
+    print(f"thermagent-server: listening on http://{host}:{port} state={args.state}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("thermagent-server: stopping")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

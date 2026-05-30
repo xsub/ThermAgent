@@ -1,0 +1,24 @@
+apiVersion: hadron.kairos.io/v1alpha1
+kind: HostPackageManifest
+metadata:
+  name: thermagent-edge
+spec:
+  description: ThermAgent Edge host service for immutable Linux images.
+  files:
+    - source: /usr/sbin/thermagentd
+      mode: "0755"
+    - source: /etc/thermagent/policy.d/jetson-nano-lite.policy
+      mode: "0644"
+    - source: /usr/lib/systemd/system/thermagentd.service
+      mode: "0644"
+  directories:
+    - path: /var/lib/thermagent
+      mode: "0755"
+    - path: /run/thermagent
+      mode: "0755"
+  services:
+    - name: thermagentd.service
+      enabled: true
+  notes:
+    - Keep local safety limits enforced by thermagentd.
+    - Include thermagentctl only on images that need on-device policy simulation.

@@ -13,3 +13,5 @@ Recommended production image contents:
 ```
 
 Keep Python tooling out of tiny production images unless policy simulation is required on-device.
+
+See `thermagent.edge.manifest.yaml` for a concrete host package manifest skeleton.

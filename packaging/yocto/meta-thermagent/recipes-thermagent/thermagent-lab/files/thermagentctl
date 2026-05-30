@@ -7,7 +7,9 @@ small Rust policy format: one `key: value` or `key = value` pair per line.
 from __future__ import annotations
 
 import argparse
+import collections
 import json
+import math
 import os
 import pathlib
 import sys
@@ -34,6 +36,7 @@ REQUIRED_KEYS = {
 }
 
 DEFAULT_WORKLOAD_PATH = pathlib.Path("/run/thermagent/workload.metrics")
+DEFAULT_REPORT_FORMAT = "markdown"
 
 
 @dataclass(frozen=True)
@@ -87,7 +90,39 @@ def parse_policy(path: pathlib.Path) -> dict[str, Any]:
         raise ValueError("critical_temp_c must be greater than max_temp_c")
     if typed["sample_interval_ms"] < 100:
         raise ValueError("sample_interval_ms should be >= 100 for this PoC")
+    if typed["workload_stale_after_s"] < 1:
+        raise ValueError("workload_stale_after_s must be >= 1")
+    if typed["min_fps"] < 0:
+        raise ValueError("min_fps must be >= 0")
+    for key, value in typed.items():
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"{key} must be a finite number")
+        if isinstance(value, str) and not value.strip():
+            raise ValueError(f"{key} must not be empty")
     return typed
+
+
+def validate_schema_subset(policy: dict[str, Any], schema_path: pathlib.Path) -> None:
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    required = set(schema.get("required", []))
+    missing = sorted(required - set(policy))
+    if missing:
+        raise ValueError(f"{schema_path}: missing schema-required keys: {', '.join(missing)}")
+
+    if schema.get("additionalProperties") is False:
+        unknown = sorted(set(policy) - set(schema.get("properties", {})))
+        if unknown:
+            raise ValueError(f"{schema_path}: keys not allowed by schema: {', '.join(unknown)}")
+
+    properties = schema.get("properties", {})
+    for key, rules in properties.items():
+        if key not in policy:
+            continue
+        value = policy[key]
+        if "minimum" in rules and value < rules["minimum"]:
+            raise ValueError(f"{key}: value {value!r} is below schema minimum {rules['minimum']}")
+        if rules.get("minLength") and isinstance(value, str) and len(value) < int(rules["minLength"]):
+            raise ValueError(f"{key}: value is shorter than schema minLength {rules['minLength']}")
 
 
 def decide(policy: dict[str, Any], temp_c: float | None, active: bool, fps: float | None, stale: bool = False) -> Decision:
@@ -102,29 +137,188 @@ def decide(policy: dict[str, Any], temp_c: float | None, active: bool, fps: floa
     return Decision("idle_or_no_workload_hint" if stale else "idle", policy["idle_nvpmodel_mode"], policy["idle_cpu_governor"])
 
 
+def load_trace(path: pathlib.Path) -> list[dict[str, Any]]:
+    rows = []
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}:{lineno}: invalid JSON: {exc}") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"{path}:{lineno}: expected JSON object")
+        rows.append(row)
+    return rows
+
+
+def simulate_rows(policy: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out = []
+    for row in rows:
+        temp_c = _maybe_float(row.get("temp_c"))
+        fps = _maybe_float(row.get("fps"))
+        active = bool(row.get("active", False))
+        stale = bool(row.get("stale", False))
+        decision = decide(policy, temp_c=temp_c, active=active, fps=fps, stale=stale)
+        out.append(
+            {
+                "t_s": _maybe_float(row.get("t_s")),
+                "temp_c": temp_c,
+                "fps": fps,
+                "active": active,
+                "stale": stale,
+                "power_mw": _row_power_mw(row),
+                "reason": decision.reason,
+                "nvpmodel_mode": decision.nvpmodel_mode,
+                "cpu_governor": decision.cpu_governor,
+            }
+        )
+    return out
+
+
+def build_report(policy: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    simulated = simulate_rows(policy, rows)
+    active_rows = [row for row in simulated if row["active"]]
+    fps_values = [row["fps"] for row in active_rows if row["fps"] is not None]
+    temp_values = [row["temp_c"] for row in simulated if row["temp_c"] is not None]
+    active_power_w = [row["power_mw"] / 1000.0 for row in active_rows if row["power_mw"] is not None]
+    reason_counts = dict(collections.Counter(row["reason"] for row in simulated))
+    avg_fps = _mean(fps_values)
+    avg_power_w = _mean(active_power_w)
+    fps_per_w = (avg_fps / avg_power_w) if avg_fps is not None and avg_power_w else None
+    energy_j, inferences = integrate_energy_and_work(simulated)
+    joules_per_inference = (energy_j / inferences) if energy_j is not None and inferences else None
+    duration_s = trace_duration_s(simulated)
+
+    return {
+        "policy": policy["name"],
+        "samples": len(simulated),
+        "duration_s": duration_s,
+        "max_temp_c": max(temp_values) if temp_values else None,
+        "active_avg_fps": avg_fps,
+        "active_avg_power_w": avg_power_w,
+        "fps_per_w": fps_per_w,
+        "energy_j": energy_j,
+        "inferences": inferences,
+        "joules_per_inference": joules_per_inference,
+        "thermal_guard_events": reason_counts.get("thermal_guard", 0),
+        "critical_cooldown_events": reason_counts.get("critical_cooldown", 0),
+        "decision_counts": reason_counts,
+    }
+
+
+def trace_duration_s(rows: list[dict[str, Any]]) -> float | None:
+    times = [row["t_s"] for row in rows if row["t_s"] is not None]
+    if len(times) < 2:
+        return None
+    return max(times) - min(times)
+
+
+def integrate_energy_and_work(rows: list[dict[str, Any]]) -> tuple[float | None, float | None]:
+    ordered = [row for row in rows if row["t_s"] is not None]
+    ordered.sort(key=lambda row: row["t_s"])
+    if len(ordered) < 2:
+        return None, None
+
+    energy_j = 0.0
+    inferences = 0.0
+    saw_power = False
+    saw_fps = False
+    for current, nxt in zip(ordered, ordered[1:]):
+        dt = max(0.0, float(nxt["t_s"] - current["t_s"]))
+        if current["power_mw"] is not None:
+            energy_j += (current["power_mw"] / 1000.0) * dt
+            saw_power = True
+        if current["active"] and current["fps"] is not None:
+            inferences += current["fps"] * dt
+            saw_fps = True
+    return (energy_j if saw_power else None, inferences if saw_fps else None)
+
+
+def render_report_markdown(report: dict[str, Any]) -> str:
+    lines = [
+        "# ThermAgent Benchmark Report",
+        "",
+        f"- Policy: `{report['policy']}`",
+        f"- Samples: {report['samples']}",
+        f"- Duration: {_fmt(report['duration_s'], 's')}",
+        f"- Max temperature: {_fmt(report['max_temp_c'], 'C')}",
+        f"- Active average FPS: {_fmt(report['active_avg_fps'])}",
+        f"- Active average power: {_fmt(report['active_avg_power_w'], 'W')}",
+        f"- FPS/W: {_fmt(report['fps_per_w'])}",
+        f"- Energy: {_fmt(report['energy_j'], 'J')}",
+        f"- Inferences: {_fmt(report['inferences'])}",
+        f"- Joules/inference: {_fmt(report['joules_per_inference'], 'J')}",
+        f"- Thermal guard events: {report['thermal_guard_events']}",
+        f"- Critical cooldown events: {report['critical_cooldown_events']}",
+        "",
+        "## Decisions",
+        "",
+        "| reason | samples |",
+        "| --- | ---: |",
+    ]
+    for reason, count in sorted(report["decision_counts"].items()):
+        lines.append(f"| `{reason}` | {count} |")
+    return "\n".join(lines) + "\n"
+
+
+def _fmt(value: float | int | None, suffix: str = "") -> str:
+    if value is None:
+        return "n/a"
+    rendered = f"{value:.3f}".rstrip("0").rstrip(".")
+    return f"{rendered} {suffix}".strip()
+
+
+def _mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _row_power_mw(row: dict[str, Any]) -> float | None:
+    if row.get("power_mw") is not None:
+        return _maybe_float(row.get("power_mw"))
+    if row.get("power_mw_sum") is not None:
+        return _maybe_float(row.get("power_mw_sum"))
+    if row.get("power_w") is not None:
+        power_w = _maybe_float(row.get("power_w"))
+        return power_w * 1000.0 if power_w is not None else None
+    return None
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     policy = parse_policy(args.policy)
+    if args.schema:
+        validate_schema_subset(policy, args.schema)
     print(json.dumps(policy, indent=2, sort_keys=True))
     return 0
 
 
 def cmd_simulate(args: argparse.Namespace) -> int:
     policy = parse_policy(args.policy)
-    trace_path: pathlib.Path = args.trace
-    rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    rows = simulate_rows(policy, load_trace(args.trace))
     print("t_s,temp_c,fps,active,reason,nvpmodel_mode,cpu_governor")
     for row in rows:
-        decision = decide(
-            policy,
-            temp_c=_maybe_float(row.get("temp_c")),
-            active=bool(row.get("active", False)),
-            fps=_maybe_float(row.get("fps")),
-            stale=bool(row.get("stale", False)),
-        )
         print(
-            f"{row.get('t_s', '')},{row.get('temp_c', '')},{row.get('fps', '')},{int(bool(row.get('active', False)))},"
-            f"{decision.reason},{decision.nvpmodel_mode},{decision.cpu_governor}"
+            f"{_csv_value(row['t_s'])},{_csv_value(row['temp_c'])},{_csv_value(row['fps'])},{int(row['active'])},"
+            f"{row['reason']},{row['nvpmodel_mode']},{row['cpu_governor']}"
         )
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    policy = parse_policy(args.policy)
+    report = build_report(policy, load_trace(args.trace))
+    if args.format == "json":
+        body = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    else:
+        body = render_report_markdown(report)
+
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(body, encoding="utf-8")
+    else:
+        print(body, end="")
     return 0
 
 
@@ -150,18 +344,30 @@ def _maybe_float(value: object) -> float | None:
     return float(value)
 
 
+def _csv_value(value: object) -> str:
+    return "" if value is None else str(value)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ThermAgent Lab helper for policy validation, simulation and workload hints")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("validate", help="validate and print a policy")
     p.add_argument("policy", type=pathlib.Path)
+    p.add_argument("--schema", type=pathlib.Path, help="validate against a JSON schema subset")
     p.set_defaults(func=cmd_validate)
 
     p = sub.add_parser("simulate", help="simulate policy decisions from a JSONL trace")
     p.add_argument("policy", type=pathlib.Path)
     p.add_argument("--trace", type=pathlib.Path, required=True)
     p.set_defaults(func=cmd_simulate)
+
+    p = sub.add_parser("report", help="generate benchmark report from a JSONL trace")
+    p.add_argument("policy", type=pathlib.Path)
+    p.add_argument("--trace", type=pathlib.Path, required=True)
+    p.add_argument("--format", choices=("markdown", "json"), default=DEFAULT_REPORT_FORMAT)
+    p.add_argument("--output", type=pathlib.Path)
+    p.set_defaults(func=cmd_report)
 
     p = sub.add_parser("emit-workload", help="write /run workload hint file for the daemon")
     p.add_argument("--path", type=pathlib.Path, default=DEFAULT_WORKLOAD_PATH)

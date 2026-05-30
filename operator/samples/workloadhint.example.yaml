@@ -1,0 +1,8 @@
+apiVersion: thermagent.io/v1alpha1
+kind: WorkloadHint
+metadata:
+  name: vision-camera-active
+spec:
+  busy: true
+  fps: 12.5
+  phase: vision

@@ -1,0 +1,9 @@
+apiVersion: thermagent.io/v1alpha1
+kind: PowerBudget
+metadata:
+  name: jetson-nano-vision-budget
+spec:
+  idleNvpmodelMode: 1
+  activeNvpmodelMode: 0
+  idleCpuGovernor: schedutil
+  activeCpuGovernor: schedutil

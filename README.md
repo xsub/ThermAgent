@@ -50,8 +50,9 @@ The PoC intentionally avoids direct GPU clocks, fan PWM, voltage, device tree an
 ## Quick local checks
 
 ```sh
-lab/python/thermagentctl validate edge/policies/jetson-nano-lite.policy
+lab/python/thermagentctl validate edge/policies/jetson-nano-lite.policy --schema schemas/thermagent-policy.schema.json
 lab/python/thermagentctl simulate edge/policies/jetson-nano-lite.policy --trace lab/traces/sample-jetson-camera.jsonl
+lab/python/thermagentctl report edge/policies/jetson-nano-lite.policy --trace lab/traces/sample-jetson-camera.jsonl
 ```
 
 Run the daemon once in dry-run mode:
