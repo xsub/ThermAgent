@@ -25,6 +25,10 @@ API surface:
 - `GET` / `POST /api/v1/policies`
 - `GET` / `POST /api/v1/rollouts`
 - `GET` / `POST /api/v1/metrics`
+- `GET /api/v1/nodes/{node_id}/policy`
+- `POST /api/v1/agents/check-in`
 - `GET /api/v1/audit`
+
+Policy distribution is pull-based: an Edge agent or deployment helper checks in with inventory and optional metrics, then receives the latest matching rollout policy as desired intent. The response always carries `local_safety_required: true`; `thermagentd` still validates policy allowlists and enforces final safety locally.
 
 Server coordinates. Edge enforces. Local safety always wins.

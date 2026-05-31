@@ -15,7 +15,7 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 DEFAULT_STATE_PATH = pathlib.Path("/tmp/thermagent-server-state.json")
 MAX_METRIC_ROWS = 1000
@@ -95,10 +95,15 @@ class StateStore:
         policy = str(payload.get("policy") or payload.get("policy_name") or "").strip()
         if not policy:
             raise ValueError("rollout payload requires policy")
+        if policy not in self.state["policies"]:
+            raise ValueError(f"rollout references unknown policy {policy}")
+        selector = payload.get("selector", {})
+        if not isinstance(selector, dict):
+            raise ValueError("rollout selector must be a JSON object")
         rollout = {
             "id": f"rollout-{len(self.state['rollouts']) + 1}",
             "policy": policy,
-            "selector": payload.get("selector", {}),
+            "selector": selector,
             "status": "pending",
             "created_unix": now_unix(),
             "local_safety_required": True,
@@ -122,6 +127,102 @@ class StateStore:
         self.audit("metrics.ingest", node_id, row)
         self.save()
         return row
+
+    def resolve_policy_for_node(self, node_id: str) -> dict[str, Any]:
+        node_id = node_id.strip()
+        inventory = self.state["inventory"].get(node_id)
+        if inventory is None:
+            raise ValueError(f"unknown node {node_id}")
+
+        rollout = next(
+            (
+                item
+                for item in reversed(self.state["rollouts"])
+                if item.get("status") in {"pending", "active"}
+                and selector_matches_inventory(item.get("selector", {}), inventory)
+            ),
+            None,
+        )
+        if rollout is None:
+            return {
+                "node_id": node_id,
+                "policy_name": None,
+                "policy": None,
+                "rollout": None,
+                "local_safety_required": True,
+                "reason": "no matching rollout",
+            }
+
+        policy_name = rollout["policy"]
+        policy = self.state["policies"].get(policy_name)
+        if policy is None:
+            return {
+                "node_id": node_id,
+                "policy_name": policy_name,
+                "policy": None,
+                "rollout": rollout,
+                "local_safety_required": True,
+                "reason": "rollout policy missing",
+            }
+
+        return {
+            "node_id": node_id,
+            "policy_name": policy_name,
+            "policy": policy,
+            "rollout": rollout,
+            "local_safety_required": True,
+            "reason": "matched rollout",
+        }
+
+    def agent_check_in(self, payload: dict[str, Any]) -> dict[str, Any]:
+        node_id = str(payload.get("node_id") or payload.get("id") or "").strip()
+        if not node_id:
+            raise ValueError("agent check-in requires node_id")
+        inventory_payload = payload.get("inventory", {})
+        if not isinstance(inventory_payload, dict):
+            raise ValueError("agent check-in inventory must be a JSON object")
+
+        inventory = {
+            **self.state["inventory"].get(node_id, {}),
+            **inventory_payload,
+            "node_id": node_id,
+            "updated_unix": now_unix(),
+        }
+        for key in ("agent_version", "current_policy", "labels", "platform", "profile"):
+            if key in payload:
+                inventory[key] = payload[key]
+        self.state["inventory"][node_id] = inventory
+
+        metric_row = None
+        if "metrics" in payload:
+            if not isinstance(payload["metrics"], dict):
+                raise ValueError("agent check-in metrics must be a JSON object")
+            metric_row = {
+                "node_id": node_id,
+                "ts_unix": int(payload.get("ts_unix") or now_unix()),
+                "metrics": payload["metrics"],
+            }
+            self.state["metrics"].append(metric_row)
+            self.state["metrics"] = self.state["metrics"][-MAX_METRIC_ROWS:]
+
+        assignment = self.resolve_policy_for_node(node_id)
+        self.audit(
+            "agent.checkin",
+            node_id,
+            {
+                "inventory": inventory,
+                "metrics": metric_row,
+                "policy_name": assignment["policy_name"],
+                "rollout_id": (assignment["rollout"] or {}).get("id"),
+            },
+        )
+        self.save()
+        return {
+            "node_id": node_id,
+            "inventory": inventory,
+            "metrics": metric_row,
+            "assignment": assignment,
+        }
 
 
 class ThermAgentHandler(BaseHTTPRequestHandler):
@@ -160,10 +261,15 @@ class ThermAgentHandler(BaseHTTPRequestHandler):
                 if node_id:
                     rows = [row for row in rows if row.get("node_id") == node_id]
                 self.respond_json(rows)
+            elif is_node_policy_path(parsed.path):
+                node_id = node_id_from_policy_path(parsed.path)
+                self.respond_json(self.store.resolve_policy_for_node(node_id))
             elif parsed.path == "/api/v1/audit":
                 self.respond_json(self.store.state["audit"])
             else:
                 self.respond_error(HTTPStatus.NOT_FOUND, "not found")
+        except ValueError as exc:
+            self.respond_error(HTTPStatus.NOT_FOUND, str(exc))
         except Exception as exc:  # noqa: BLE001 - request boundary
             self.respond_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
 
@@ -179,6 +285,8 @@ class ThermAgentHandler(BaseHTTPRequestHandler):
                 self.respond_json(self.store.create_rollout(payload), HTTPStatus.CREATED)
             elif parsed.path == "/api/v1/metrics":
                 self.respond_json(self.store.ingest_metrics(payload), HTTPStatus.CREATED)
+            elif parsed.path == "/api/v1/agents/check-in":
+                self.respond_json(self.store.agent_check_in(payload))
             else:
                 self.respond_error(HTTPStatus.NOT_FOUND, "not found")
         except ValueError as exc:
@@ -233,9 +341,43 @@ def api_index() -> dict[str, Any]:
             "POST /api/v1/rollouts",
             "GET /api/v1/metrics",
             "POST /api/v1/metrics",
+            "GET /api/v1/nodes/{node_id}/policy",
+            "POST /api/v1/agents/check-in",
             "GET /api/v1/audit",
         ],
     }
+
+
+def selector_matches_inventory(selector: dict[str, Any], inventory: dict[str, Any]) -> bool:
+    if not selector:
+        return True
+    labels = inventory.get("labels", {})
+    if labels is None:
+        labels = {}
+    if not isinstance(labels, dict):
+        labels = {}
+    for key, expected in selector.items():
+        if key == "labels" and isinstance(expected, dict):
+            for label_key, label_value in expected.items():
+                if labels.get(label_key) != label_value:
+                    return False
+            continue
+        if key in inventory:
+            if inventory[key] != expected:
+                return False
+            continue
+        if labels.get(key) != expected:
+            return False
+    return True
+
+
+def is_node_policy_path(path: str) -> bool:
+    parts = path.strip("/").split("/")
+    return len(parts) == 5 and parts[:3] == ["api", "v1", "nodes"] and parts[4] == "policy"
+
+
+def node_id_from_policy_path(path: str) -> str:
+    return unquote(path.strip("/").split("/")[3])
 
 
 def render_index(state: dict[str, Any]) -> str:
