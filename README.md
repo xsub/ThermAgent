@@ -49,6 +49,7 @@ Run the daemon once in dry-run mode:
 
 ```sh
 cd edge/rust/thermagentd
+cargo run -- --config ../../policies/jetson-nano-lite.policy --preflight
 cargo run -- --config ../../policies/jetson-nano-lite.policy --dry-run --once
 ```
 

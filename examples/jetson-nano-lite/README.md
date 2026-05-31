@@ -16,4 +16,5 @@ Run locally:
 
 ```sh
 thermagentctl validate jetson-nano-lite.policy
+thermagentd --config jetson-nano-lite.policy --preflight
 ```

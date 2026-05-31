@@ -97,6 +97,7 @@ struct Args {
     config: String,
     dry_run: bool,
     once: bool,
+    preflight: bool,
     interval_ms: Option<u64>,
     prometheus_listen: Option<String>,
 }
@@ -142,6 +143,20 @@ struct DecisionState {
     critical_cooldown_latched: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreflightStatus {
+    Ok,
+    Warn,
+    Fail,
+}
+
+#[derive(Debug, Clone)]
+struct PreflightCheck {
+    name: String,
+    status: PreflightStatus,
+    detail: String,
+}
+
 #[derive(Debug, Clone, Default)]
 struct SharedMetrics {
     ts_unix: u64,
@@ -182,6 +197,15 @@ fn main() {
     }
     if let Some(addr) = args.prometheus_listen.clone() {
         policy.prometheus_listen = addr;
+    }
+
+    if args.preflight {
+        let checks = run_preflight(&policy);
+        print_preflight(&checks);
+        if preflight_has_failures(&checks) {
+            std::process::exit(1);
+        }
+        return;
     }
 
     println!(
@@ -278,6 +302,7 @@ fn parse_args_or_exit() -> Args {
         config: DEFAULT_POLICY.to_string(),
         dry_run: false,
         once: false,
+        preflight: false,
         interval_ms: None,
         prometheus_listen: None,
     };
@@ -288,6 +313,7 @@ fn parse_args_or_exit() -> Args {
             "--config" | "-c" => args.config = required_value(&mut iter, "--config"),
             "--dry-run" => args.dry_run = true,
             "--once" => args.once = true,
+            "--preflight" => args.preflight = true,
             "--interval-ms" => {
                 let value = required_value(&mut iter, "--interval-ms");
                 args.interval_ms = Some(value.parse::<u64>().unwrap_or_else(|_| {
@@ -322,7 +348,7 @@ fn required_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> String
 fn print_help() {
     println!(
         "thermagentd 0.1.0\n\n\
-         Usage:\n  thermagentd [--config PATH] [--dry-run] [--once] [--interval-ms N] [--prometheus ADDR]\n\n\
+         Usage:\n  thermagentd [--config PATH] [--dry-run] [--once] [--preflight] [--interval-ms N] [--prometheus ADDR]\n\n\
          Defaults:\n  --config {}\n  --prometheus 127.0.0.1:9920\n",
         DEFAULT_POLICY
     );
@@ -548,6 +574,227 @@ fn parse_u8_list(key: &str, value: &str) -> Result<Vec<u8>, String> {
         .filter(|item| !item.is_empty())
         .map(|item| parse_u8(key, item))
         .collect()
+}
+
+fn run_preflight(policy: &Policy) -> Vec<PreflightCheck> {
+    let mut checks = Vec::new();
+    checks.push(PreflightCheck {
+        name: "policy".to_string(),
+        status: PreflightStatus::Ok,
+        detail: format!("{} parsed and validated", policy.name),
+    });
+    checks.push(preflight_thermal(policy));
+    checks.push(preflight_cpu_governors(policy));
+    checks.push(preflight_nvpmodel(policy));
+    checks.push(preflight_path_parent(
+        "workload_file",
+        &policy.workload_file,
+        false,
+    ));
+    checks.push(preflight_path_parent(
+        "state_file",
+        &policy.state_file,
+        true,
+    ));
+    checks
+}
+
+fn preflight_thermal(policy: &Policy) -> PreflightCheck {
+    let zones = read_thermal_zones();
+    if zones.is_empty() {
+        return PreflightCheck {
+            name: "thermal_zones".to_string(),
+            status: if policy.missing_thermal_is_hot {
+                PreflightStatus::Warn
+            } else {
+                PreflightStatus::Fail
+            },
+            detail: "no thermal zones discovered".to_string(),
+        };
+    }
+    let names = zones
+        .iter()
+        .map(|zone| format!("{}={:.1}C", zone.name, zone.temp_c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    PreflightCheck {
+        name: "thermal_zones".to_string(),
+        status: PreflightStatus::Ok,
+        detail: names,
+    }
+}
+
+fn preflight_cpu_governors(policy: &Policy) -> PreflightCheck {
+    let desired = desired_governors(policy);
+    let files = cpu_governor_files();
+    if files.is_empty() {
+        return PreflightCheck {
+            name: "cpu_governors".to_string(),
+            status: PreflightStatus::Fail,
+            detail: "no cpufreq scaling_governor files found".to_string(),
+        };
+    }
+
+    let mut failures = Vec::new();
+    let mut warnings = Vec::new();
+    for file in &files {
+        let available_path = file
+            .parent()
+            .map(|parent| parent.join("scaling_available_governors"));
+        let Some(available_path) = available_path else {
+            warnings.push(format!("{} has no cpufreq parent", file.display()));
+            continue;
+        };
+        let Some(available) = read_trim(&available_path) else {
+            warnings.push(format!("{} missing", available_path.display()));
+            continue;
+        };
+        for governor in &desired {
+            if !available.split_whitespace().any(|item| item == governor) {
+                failures.push(format!("{} lacks {}", file.display(), governor));
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        return PreflightCheck {
+            name: "cpu_governors".to_string(),
+            status: PreflightStatus::Fail,
+            detail: failures.join("; "),
+        };
+    }
+    if !warnings.is_empty() {
+        return PreflightCheck {
+            name: "cpu_governors".to_string(),
+            status: PreflightStatus::Warn,
+            detail: warnings.join("; "),
+        };
+    }
+    PreflightCheck {
+        name: "cpu_governors".to_string(),
+        status: PreflightStatus::Ok,
+        detail: format!("{} cpus support {}", files.len(), desired.join(",")),
+    }
+}
+
+fn preflight_nvpmodel(policy: &Policy) -> PreflightCheck {
+    let path = Path::new(&policy.nvpmodel_bin);
+    if !path.exists() {
+        return PreflightCheck {
+            name: "nvpmodel".to_string(),
+            status: PreflightStatus::Fail,
+            detail: format!("{} does not exist", policy.nvpmodel_bin),
+        };
+    }
+    PreflightCheck {
+        name: "nvpmodel".to_string(),
+        status: PreflightStatus::Ok,
+        detail: format!(
+            "{} present; policy modes: {}",
+            policy.nvpmodel_bin,
+            desired_nvpmodel_modes(policy)
+                .iter()
+                .map(|mode| mode.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
+}
+
+fn preflight_path_parent(name: &str, path: &str, create: bool) -> PreflightCheck {
+    let target = Path::new(path);
+    let Some(parent) = target.parent() else {
+        return PreflightCheck {
+            name: name.to_string(),
+            status: PreflightStatus::Warn,
+            detail: "path has no parent directory".to_string(),
+        };
+    };
+    if parent.as_os_str().is_empty() {
+        return PreflightCheck {
+            name: name.to_string(),
+            status: PreflightStatus::Ok,
+            detail: "relative path in current directory".to_string(),
+        };
+    }
+    if parent.exists() {
+        return PreflightCheck {
+            name: name.to_string(),
+            status: PreflightStatus::Ok,
+            detail: format!("{} exists", parent.display()),
+        };
+    }
+    PreflightCheck {
+        name: name.to_string(),
+        status: if create {
+            PreflightStatus::Warn
+        } else {
+            PreflightStatus::Fail
+        },
+        detail: format!("{} is missing", parent.display()),
+    }
+}
+
+fn desired_governors(policy: &Policy) -> Vec<String> {
+    let mut set = BTreeSet::new();
+    set.insert(policy.idle_cpu_governor.clone());
+    set.insert(policy.active_cpu_governor.clone());
+    set.insert(policy.hot_cpu_governor.clone());
+    set.into_iter().collect()
+}
+
+fn desired_nvpmodel_modes(policy: &Policy) -> Vec<u8> {
+    let mut set = BTreeSet::new();
+    set.insert(policy.idle_nvpmodel_mode);
+    set.insert(policy.active_nvpmodel_mode);
+    set.insert(policy.hot_nvpmodel_mode);
+    set.into_iter().collect()
+}
+
+fn cpu_governor_files() -> Vec<PathBuf> {
+    let base = Path::new("/sys/devices/system/cpu");
+    let entries = match fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !is_cpu_dir(&name) {
+            continue;
+        }
+        let path = entry.path().join("cpufreq/scaling_governor");
+        if path.exists() {
+            files.push(path);
+        }
+    }
+    files
+}
+
+fn print_preflight(checks: &[PreflightCheck]) {
+    println!("thermagentd: preflight");
+    for check in checks {
+        println!(
+            "{}\t{}\t{}",
+            preflight_status_label(&check.status),
+            check.name,
+            check.detail
+        );
+    }
+}
+
+fn preflight_status_label(status: &PreflightStatus) -> &'static str {
+    match status {
+        PreflightStatus::Ok => "ok",
+        PreflightStatus::Warn => "warn",
+        PreflightStatus::Fail => "fail",
+    }
+}
+
+fn preflight_has_failures(checks: &[PreflightCheck]) -> bool {
+    checks
+        .iter()
+        .any(|check| check.status == PreflightStatus::Fail)
 }
 
 fn collect_telemetry() -> Telemetry {
@@ -1502,6 +1749,51 @@ allowed_nvpmodel_modes: 0,1
         assert!(body.contains("\"reason\": \"active\""));
         assert!(body.contains("\"workload_phase\": \"vision\""));
         assert!(body.contains("\"actions_failed\": 2"));
+    }
+
+    #[test]
+    fn preflight_helpers_detect_failures_and_deduplicate_targets() {
+        let policy = Policy {
+            idle_cpu_governor: "schedutil".to_string(),
+            active_cpu_governor: "schedutil".to_string(),
+            hot_cpu_governor: "powersave".to_string(),
+            idle_nvpmodel_mode: 1,
+            active_nvpmodel_mode: 0,
+            hot_nvpmodel_mode: 1,
+            ..Policy::default()
+        };
+        let checks = vec![
+            PreflightCheck {
+                name: "ok".to_string(),
+                status: PreflightStatus::Ok,
+                detail: "fine".to_string(),
+            },
+            PreflightCheck {
+                name: "bad".to_string(),
+                status: PreflightStatus::Fail,
+                detail: "nope".to_string(),
+            },
+        ];
+
+        assert!(preflight_has_failures(&checks));
+        assert_eq!(desired_governors(&policy), vec!["powersave", "schedutil"]);
+        assert_eq!(desired_nvpmodel_modes(&policy), vec![0, 1]);
+    }
+
+    #[test]
+    fn preflight_path_parent_allows_creatable_state_parent_as_warning() {
+        let mut path = env::temp_dir();
+        path.push(format!(
+            "thermagentd-missing-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        path.push("state.json");
+
+        let check = preflight_path_parent("state_file", path.to_str().expect("utf-8 path"), true);
+
+        assert_eq!(check.status, PreflightStatus::Warn);
+        assert!(check.detail.contains("is missing"));
     }
 
     #[test]
