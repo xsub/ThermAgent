@@ -29,3 +29,6 @@ hot_cpu_governor: powersave
 nvpmodel_bin: /usr/sbin/nvpmodel
 workload_file: /run/thermagent/workload.metrics
 prometheus_listen: 127.0.0.1:9920
+state_file: /var/lib/thermagent/state.json
+allowed_cpu_governors: schedutil,powersave
+allowed_nvpmodel_modes: 0,1

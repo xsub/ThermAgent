@@ -32,6 +32,9 @@ const OPTIONAL_POLICY_KEYS: &[&str] = &[
     "critical_hysteresis_c",
     "decision_hold_s",
     "missing_thermal_is_hot",
+    "state_file",
+    "allowed_cpu_governors",
+    "allowed_nvpmodel_modes",
 ];
 
 #[derive(Debug, Clone)]
@@ -55,6 +58,9 @@ struct Policy {
     critical_hysteresis_c: f64,
     decision_hold_s: u64,
     missing_thermal_is_hot: bool,
+    state_file: String,
+    allowed_cpu_governors: Vec<String>,
+    allowed_nvpmodel_modes: Vec<u8>,
 }
 
 impl Default for Policy {
@@ -79,6 +85,9 @@ impl Default for Policy {
             critical_hysteresis_c: 3.0,
             decision_hold_s: 5,
             missing_thermal_is_hot: true,
+            state_file: "/var/lib/thermagent/state.json".to_string(),
+            allowed_cpu_governors: Vec::new(),
+            allowed_nvpmodel_modes: Vec::new(),
         }
     }
 }
@@ -223,6 +232,17 @@ fn main() {
             }
         }
 
+        if let Err(err) = write_state_file(
+            &policy.state_file,
+            &policy,
+            &telemetry,
+            &workload,
+            &decision,
+            actions_failed,
+        ) {
+            eprintln!("thermagentd: state write failed: {}", err);
+        }
+
         if let Ok(mut guard) = shared.lock() {
             *guard = SharedMetrics {
                 ts_unix: telemetry.ts_unix,
@@ -349,6 +369,9 @@ fn read_policy(path: &str) -> Result<Policy, String> {
             "critical_hysteresis_c" => policy.critical_hysteresis_c = parse_f64(key, &value)?,
             "decision_hold_s" => policy.decision_hold_s = parse_u64(key, &value)?,
             "missing_thermal_is_hot" => policy.missing_thermal_is_hot = parse_bool(key, &value)?,
+            "state_file" => policy.state_file = value,
+            "allowed_cpu_governors" => policy.allowed_cpu_governors = parse_string_list(&value),
+            "allowed_nvpmodel_modes" => policy.allowed_nvpmodel_modes = parse_u8_list(key, &value)?,
             unknown => return Err(format!("line {}: unknown key {}", idx + 1, unknown)),
         }
         seen.insert(key.to_string());
@@ -410,6 +433,9 @@ fn validate_policy(policy: &Policy) -> Result<(), String> {
     if !policy.critical_hysteresis_c.is_finite() || policy.critical_hysteresis_c < 0.0 {
         return Err("critical_hysteresis_c must be a finite number >= 0".to_string());
     }
+    if policy.state_file.trim().is_empty() {
+        return Err("state_file must not be empty".to_string());
+    }
     for (key, value) in [
         ("idle_cpu_governor", &policy.idle_cpu_governor),
         ("active_cpu_governor", &policy.active_cpu_governor),
@@ -419,6 +445,45 @@ fn validate_policy(policy: &Policy) -> Result<(), String> {
     ] {
         if value.trim().is_empty() {
             return Err(format!("{} must not be empty", key));
+        }
+    }
+    for governor in &policy.allowed_cpu_governors {
+        if governor.trim().is_empty() {
+            return Err("allowed_cpu_governors must not contain empty values".to_string());
+        }
+    }
+    for governor in [
+        &policy.idle_cpu_governor,
+        &policy.active_cpu_governor,
+        &policy.hot_cpu_governor,
+    ] {
+        if !policy.allowed_cpu_governors.is_empty()
+            && !policy
+                .allowed_cpu_governors
+                .iter()
+                .any(|allowed| allowed == governor)
+        {
+            return Err(format!(
+                "{} is not listed in allowed_cpu_governors",
+                governor
+            ));
+        }
+    }
+    for mode in [
+        policy.idle_nvpmodel_mode,
+        policy.active_nvpmodel_mode,
+        policy.hot_nvpmodel_mode,
+    ] {
+        if !policy.allowed_nvpmodel_modes.is_empty()
+            && !policy
+                .allowed_nvpmodel_modes
+                .iter()
+                .any(|allowed| *allowed == mode)
+        {
+            return Err(format!(
+                "nvpmodel mode {} is not listed in allowed_nvpmodel_modes",
+                mode
+            ));
         }
     }
     Ok(())
@@ -465,6 +530,24 @@ fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
         "0" | "false" | "no" | "off" => Ok(false),
         _ => Err(format!("{} expects boolean, got {}", key, value)),
     }
+}
+
+fn parse_string_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn parse_u8_list(key: &str, value: &str) -> Result<Vec<u8>, String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| parse_u8(key, item))
+        .collect()
 }
 
 fn collect_telemetry() -> Telemetry {
@@ -805,11 +888,38 @@ fn apply_decision(
     dry_run: bool,
     last_nvpmodel_mode: &mut Option<u8>,
 ) -> Result<(), String> {
+    validate_decision_allowed(policy, decision)?;
     set_cpu_governor(&decision.cpu_governor, dry_run)?;
 
     if *last_nvpmodel_mode != Some(decision.nvpmodel_mode) {
         set_nvpmodel(policy, decision.nvpmodel_mode, dry_run)?;
         *last_nvpmodel_mode = Some(decision.nvpmodel_mode);
+    }
+    Ok(())
+}
+
+fn validate_decision_allowed(policy: &Policy, decision: &Decision) -> Result<(), String> {
+    if !policy.allowed_cpu_governors.is_empty()
+        && !policy
+            .allowed_cpu_governors
+            .iter()
+            .any(|governor| governor == &decision.cpu_governor)
+    {
+        return Err(format!(
+            "cpu governor {} is not allowed by policy",
+            decision.cpu_governor
+        ));
+    }
+    if !policy.allowed_nvpmodel_modes.is_empty()
+        && !policy
+            .allowed_nvpmodel_modes
+            .iter()
+            .any(|mode| *mode == decision.nvpmodel_mode)
+    {
+        return Err(format!(
+            "nvpmodel mode {} is not allowed by policy",
+            decision.nvpmodel_mode
+        ));
     }
     Ok(())
 }
@@ -830,6 +940,19 @@ fn set_cpu_governor(governor: &str, dry_run: bool) -> Result<(), String> {
             continue;
         }
         attempted += 1;
+        if let Some(available) = read_trim(entry.path().join("cpufreq/scaling_available_governors"))
+        {
+            let listed = available.split_whitespace().any(|item| item == governor);
+            if !listed {
+                failures.push(format!(
+                    "{}: governor {} is not in scaling_available_governors ({})",
+                    path.display(),
+                    governor,
+                    available
+                ));
+                continue;
+            }
+        }
         if dry_run {
             println!(
                 "thermagentd: dry-run write {} -> {}",
@@ -878,6 +1001,72 @@ fn set_nvpmodel(policy: &Policy, mode: u8, dry_run: bool) -> Result<(), String> 
             policy.nvpmodel_bin, mode, status
         ))
     }
+}
+
+fn write_state_file(
+    path: &str,
+    policy: &Policy,
+    telemetry: &Telemetry,
+    workload: &WorkloadHint,
+    decision: &Decision,
+    actions_failed: u64,
+) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Ok(());
+    }
+    let body = render_state_json(policy, telemetry, workload, decision, actions_failed);
+    let state_path = Path::new(path);
+    if let Some(parent) = state_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("create state dir {}: {}", parent.display(), err))?;
+        }
+    }
+    let tmp_path = state_path.with_extension("json.tmp");
+    fs::write(&tmp_path, body).map_err(|err| format!("write {}: {}", tmp_path.display(), err))?;
+    fs::rename(&tmp_path, state_path).map_err(|err| {
+        format!(
+            "rename {} -> {}: {}",
+            tmp_path.display(),
+            state_path.display(),
+            err
+        )
+    })
+}
+
+fn render_state_json(
+    policy: &Policy,
+    telemetry: &Telemetry,
+    workload: &WorkloadHint,
+    decision: &Decision,
+    actions_failed: u64,
+) -> String {
+    format!(
+        "{{\n  \"ts_unix\": {},\n  \"policy\": \"{}\",\n  \"reason\": \"{}\",\n  \"max_temp_c\": {},\n  \"workload_active\": {},\n  \"workload_fps\": {},\n  \"workload_phase\": {},\n  \"workload_stale\": {},\n  \"nvpmodel_mode\": {},\n  \"cpu_governor\": \"{}\",\n  \"actions_failed\": {}\n}}\n",
+        telemetry.ts_unix,
+        escape_json(&policy.name),
+        escape_json(&decision.reason),
+        json_opt_f64(telemetry.max_temp_c),
+        workload.active,
+        json_opt_f64(workload.fps),
+        json_opt_string(workload.phase.as_deref()),
+        workload.stale,
+        decision.nvpmodel_mode,
+        escape_json(&decision.cpu_governor),
+        actions_failed
+    )
+}
+
+fn json_opt_f64(value: Option<f64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn json_opt_string(value: Option<&str>) -> String {
+    value
+        .map(|v| format!("\"{}\"", escape_json(v)))
+        .unwrap_or_else(|| "null".to_string())
 }
 
 fn serve_metrics(addr: String, shared: Arc<Mutex<SharedMetrics>>) -> Result<(), String> {
@@ -1047,6 +1236,10 @@ fn escape_label(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
+fn escape_json(value: &str) -> String {
+    escape_label(value)
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1090,6 +1283,9 @@ hot_cpu_governor: powersave
 nvpmodel_bin: /usr/sbin/nvpmodel
 workload_file: /run/thermagent/workload.metrics
 prometheus_listen: 127.0.0.1:9920
+state_file: /var/lib/thermagent/state.json
+allowed_cpu_governors: schedutil,powersave
+allowed_nvpmodel_modes: 0,1
 "#
     }
 
@@ -1120,6 +1316,9 @@ prometheus_listen: 127.0.0.1:9920
         let _ = fs::remove_file(path);
         assert_eq!(policy.name, "jetson-nano-lite-safe-vision");
         assert_eq!(policy.hot_cpu_governor, "powersave");
+        assert_eq!(policy.state_file, "/var/lib/thermagent/state.json");
+        assert_eq!(policy.allowed_cpu_governors, vec!["schedutil", "powersave"]);
+        assert_eq!(policy.allowed_nvpmodel_modes, vec![0, 1]);
     }
 
     #[test]
@@ -1257,6 +1456,52 @@ prometheus_listen: 127.0.0.1:9920
         assert_eq!(first.reason, "active");
         assert_eq!(held.reason, "active");
         assert_eq!(released.reason, "idle");
+    }
+
+    #[test]
+    fn validate_decision_allowed_rejects_unlisted_actions() {
+        let policy = Policy {
+            allowed_cpu_governors: vec!["powersave".to_string()],
+            allowed_nvpmodel_modes: vec![1],
+            ..Policy::default()
+        };
+        let decision = Decision {
+            reason: "active".to_string(),
+            nvpmodel_mode: 0,
+            cpu_governor: "schedutil".to_string(),
+        };
+
+        let err = validate_decision_allowed(&policy, &decision).expect_err("decision should fail");
+
+        assert!(err.contains("cpu governor schedutil is not allowed"));
+    }
+
+    #[test]
+    fn render_state_json_includes_debuggable_last_state() {
+        let policy = Policy::default();
+        let telemetry = Telemetry {
+            ts_unix: 123,
+            max_temp_c: Some(61.5),
+            ..Telemetry::default()
+        };
+        let workload = WorkloadHint {
+            active: true,
+            fps: Some(12.5),
+            phase: Some("vision".to_string()),
+            stale: false,
+        };
+        let decision = Decision {
+            reason: "active".to_string(),
+            nvpmodel_mode: 0,
+            cpu_governor: "schedutil".to_string(),
+        };
+
+        let body = render_state_json(&policy, &telemetry, &workload, &decision, 2);
+
+        assert!(body.contains("\"ts_unix\": 123"));
+        assert!(body.contains("\"reason\": \"active\""));
+        assert!(body.contains("\"workload_phase\": \"vision\""));
+        assert!(body.contains("\"actions_failed\": 2"));
     }
 
     #[test]

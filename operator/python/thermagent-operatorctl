@@ -32,6 +32,9 @@ POLICY_ORDER = [
     "nvpmodel_bin",
     "workload_file",
     "prometheus_listen",
+    "state_file",
+    "allowed_cpu_governors",
+    "allowed_nvpmodel_modes",
 ]
 
 

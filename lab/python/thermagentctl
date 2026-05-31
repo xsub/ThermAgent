@@ -26,6 +26,14 @@ def _parse_bool(value: str) -> bool:
     raise ValueError(f"expected boolean, got {value!r}")
 
 
+def _parse_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _parse_u8_csv(value: str) -> list[int]:
+    return [int(item) for item in _parse_csv(value)]
+
+
 REQUIRED_KEYS = {
     "name": str,
     "sample_interval_ms": int,
@@ -48,12 +56,18 @@ OPTIONAL_KEYS = {
     "critical_hysteresis_c": float,
     "decision_hold_s": int,
     "missing_thermal_is_hot": _parse_bool,
+    "state_file": str,
+    "allowed_cpu_governors": _parse_csv,
+    "allowed_nvpmodel_modes": _parse_u8_csv,
 }
 DEFAULTS = {
     "thermal_hysteresis_c": 3.0,
     "critical_hysteresis_c": 3.0,
     "decision_hold_s": 5,
     "missing_thermal_is_hot": True,
+    "state_file": "/var/lib/thermagent/state.json",
+    "allowed_cpu_governors": [],
+    "allowed_nvpmodel_modes": [],
 }
 
 DEFAULT_WORKLOAD_PATH = pathlib.Path("/run/thermagent/workload.metrics")
@@ -140,6 +154,17 @@ def parse_policy(path: pathlib.Path) -> dict[str, Any]:
         raise ValueError("critical_hysteresis_c must be >= 0")
     if typed["decision_hold_s"] < 0:
         raise ValueError("decision_hold_s must be >= 0")
+    if not typed["state_file"].strip():
+        raise ValueError("state_file must not be empty")
+    for governor in typed["allowed_cpu_governors"]:
+        if not governor.strip():
+            raise ValueError("allowed_cpu_governors must not contain empty values")
+    for governor_key in ("idle_cpu_governor", "active_cpu_governor", "hot_cpu_governor"):
+        if typed["allowed_cpu_governors"] and typed[governor_key] not in typed["allowed_cpu_governors"]:
+            raise ValueError(f"{governor_key} is not listed in allowed_cpu_governors")
+    for mode_key in ("idle_nvpmodel_mode", "active_nvpmodel_mode", "hot_nvpmodel_mode"):
+        if typed["allowed_nvpmodel_modes"] and typed[mode_key] not in typed["allowed_nvpmodel_modes"]:
+            raise ValueError(f"{mode_key} is not listed in allowed_nvpmodel_modes")
     for key, value in typed.items():
         if isinstance(value, float) and not math.isfinite(value):
             raise ValueError(f"{key} must be a finite number")

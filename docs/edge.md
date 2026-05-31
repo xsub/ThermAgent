@@ -13,6 +13,6 @@ Responsibilities:
 - expose local metrics,
 - reject unsafe or unsupported actions.
 
-Current Edge policy behavior includes thermal hysteresis, a short decision hold interval to reduce mode flapping, and a conservative hot-mode fallback when thermal telemetry is missing.
+Current Edge policy behavior includes thermal hysteresis, a short decision hold interval to reduce mode flapping, a conservative hot-mode fallback when thermal telemetry is missing, policy allowlists for CPU governors and `nvpmodel` modes, and a local state file for post-restart debugging.
 
 The local agent must keep final safety control even when policies are distributed by Server or Operator.

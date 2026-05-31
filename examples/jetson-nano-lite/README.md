@@ -8,7 +8,9 @@ It uses conservative controls:
 - `nvpmodel` mode 0 for active vision workload,
 - CPU governor selection,
 - local thermal limits,
-- thermal hysteresis and short decision hold to avoid rapid mode flapping.
+- thermal hysteresis and short decision hold to avoid rapid mode flapping,
+- policy allowlists for CPU governors and `nvpmodel` modes,
+- `/var/lib/thermagent/state.json` with the latest decision state.
 
 Run locally:
 

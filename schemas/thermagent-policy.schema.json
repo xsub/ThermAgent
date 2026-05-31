@@ -40,6 +40,15 @@
     "thermal_hysteresis_c": {"type": "number", "minimum": 0},
     "critical_hysteresis_c": {"type": "number", "minimum": 0},
     "decision_hold_s": {"type": "integer", "minimum": 0},
-    "missing_thermal_is_hot": {"type": "boolean"}
+    "missing_thermal_is_hot": {"type": "boolean"},
+    "state_file": {"type": "string", "minLength": 1},
+    "allowed_cpu_governors": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "allowed_nvpmodel_modes": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0}
+    }
   }
 }
